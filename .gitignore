@@ -1,0 +1,7 @@
+vi.map
+*.o
+selftest.prg
+selftest.c
+emu.log
+tests/scr.out
+.DS_Store

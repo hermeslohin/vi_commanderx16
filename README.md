@@ -1,0 +1,77 @@
+# VI for the Commander X16
+
+A small vi clone written in C (cc65) with syntax highlighting for **C**, **BASIC** and **6502 assembly**.
+It draws directly into VERA text memory in ISO mode, so files are plain ASCII.
+
+## Build / run
+
+Requires [cc65](https://cc65.github.io/) and the [x16emu](https://github.com/X16Community/x16-emulator) emulator
+(paths are set at the top of the `Makefile`). A prebuilt `VI.PRG` is included.
+
+    make            # -> VI.PRG        (needs cc65: cl65)
+    make run        # runs it in x16emu with this folder as the SD card root
+
+On the X16: `LOAD "VI.PRG"` then `RUN`.
+
+## Quick start
+
+1. **Get it running**
+   * Emulator: `make run` (builds, then starts x16emu with this folder as the SD card).
+   * Real hardware / emulator: copy `VI.PRG` to the SD card, then `LOAD "VI.PRG"` and `RUN`.
+2. **Open a file**: type `:e hello.c` and press Enter (a new name starts an empty file).
+3. **Edit**: press `i` to insert text, `Esc` to return to normal mode.
+4. **Save and quit**: `:wq` (or `ZZ`). Use `:q!` to quit without saving.
+
+### A first session
+
+    :e demo.bas        open (or create) a BASIC file; syntax is picked from the extension
+    i                  enter insert mode
+    10 PRINT "HELLO"   type some text
+    Esc                back to normal mode
+    yy  p              copy the line and paste it below
+    u                  undo (press again to redo)
+    /PRINT  n          search forward, jump to the next match
+    :w                 save
+    :q                 quit
+
+### Modes
+
+| mode    | how to enter                  | what it does                          |
+|---------|-------------------------------|---------------------------------------|
+| normal  | `Esc`                         | movement and editing commands         |
+| insert  | `i a I A o O s C`             | type text                             |
+| replace | `R`                           | overwrite characters as you type      |
+| command | `:`                           | ex commands, `/` and `?` for search   |
+
+Type `:help` inside the editor for a command summary.
+
+## Syntax highlighting
+
+Chosen from the file extension, or set manually with `:set syntax=c|basic|asm|none`.
+
+| language | extensions            | highlights                                                        |
+|----------|-----------------------|-------------------------------------------------------------------|
+| C        | .c .h                 | keywords, types, `#preprocessor`, strings, numbers, `//` and `/* */` (multi-line) |
+| BASIC    | .bas .bi              | keywords (incl. X16 BASIC 2: VPOKE, LOCATE, ...), functions, line numbers, REM, strings, numbers |
+| assembly | .asm .s .inc .a65 .a  | 65C02 mnemonics, `.directives`, labels, `$hex`/`%bin`, `;` comments, registers |
+
+## Commands
+
+Normal mode: `h j k l` / arrows, `0 ^ $`, `w b`, `gg G` (`12G`), `%`, `Ctrl-F`/`Ctrl-B`,
+`i a I A o O R`, `x X r s D C J`, `dd dw d$ d0 db` (also `y` and `c` forms), `yy Y p P`,
+`u` (undo / redo toggle), `/text ? n N`, counts (`3dd`, `5x`), `ZZ`.
+
+Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to line),
+`:set nu|nonu`, `:set ts=N`, `:set ai|noai`, `:set syntax=...`, `:help`.
+
+## Limits
+
+* The text buffer lives in main RAM: **about 9000 bytes / 500 lines** (the editor itself uses most of the ~38 KB).
+  Larger files are truncated on load and `:w` is refused until you force it with `:w!`.
+* Undo is single level (a snapshot kept in banked RAM, banks 1-8).
+* BASIC keywords are only highlighted as whole words (`FOR I=1 TO 10`, not `FORI=1TO10`).
+
+## Self test
+
+`./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes, dumps the VERA
+screen (characters and colour indexes) to `tests/scr.out` and prints it. Sample sources are in `tests/`.
