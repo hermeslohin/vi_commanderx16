@@ -2955,12 +2955,47 @@ main {
         }
     }
 
+    ubyte[41] argbuf
+
+    ; Startup file hand-off used by `make run FILE=name`: if a small file called VI.ARG exists
+    ; on the drive, its first line is a file name to open at start-up. Normally it does not
+    ; exist, and this does nothing. Returns true (name in argbuf) if a name was read.
+    sub startup_arg() -> bool {
+        ubyte n = 0
+        ubyte c
+        ubyte stt
+        cbm.SETNAM(10, "vi.arg,s,r")
+        cbm.SETLFS(2, DEVICE, 2)
+        void cbm.OPEN()
+        void cbm.CHKIN(2)
+        repeat {
+            c = cbm.CHRIN()
+            stt = cbm.READST()
+            if stt & $bf != 0
+                break
+            if c == 13 or c == 10
+                break
+            if n < FNLEN {
+                argbuf[n] = c
+                n++
+            }
+            if stt & $40 != 0
+                break
+        }
+        argbuf[n] = 0
+        cbm.CLRCHN()
+        cbm.CLOSE(2)
+        dos_status(&dstat, 40)          ; also clears the drive's error light if the file was missing
+        return n != 0
+    }
+
     ;@SELFTEST-SUBS
 
     ; Program entry: set up the screen, run the editor, then restore the console on exit.
     sub start() {
         ubyte x
         ubyte y
+        bool opened
         sys.memset(cstate, 70, 0)
         init_screen()
         iso_mode()
@@ -2982,7 +3017,11 @@ main {
         fname[0] = 0
         msg[0] = 0
         ;@SELFTEST-INIT
-        setmsg(iso:"vi for X16 - :e <file>  :help")
+        opened = startup_arg()
+        if opened
+            open_file(&argbuf)
+        if not opened
+            setmsg(iso:"vi for X16 - :e <file>  :help")
         editor()
         cbm.CHROUT($8f)        ; ISO mode off (back to PETSCII)
         cbm.CHROUT($93)        ; clear screen

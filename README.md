@@ -11,6 +11,7 @@ Requires the [Prog8](https://github.com/irmen/prog8/releases) compiler (`prog8c-
 
     make            # -> VI.PRG
     make run        # runs it in x16emu with this folder as the SD card root
+    make run FILE=tests/test.p8   # ...and opens that file (path relative to this folder)
 
 On the X16: `LOAD "VI.PRG"` then `RUN`.
 
