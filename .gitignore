@@ -1,9 +1,6 @@
-vi.map
-*.o
-selftest.prg
-selftest.c
 emu.log
 tests/scr.out
+tests/SCR.OUT
 .DS_Store
 p8build/
 build_test/

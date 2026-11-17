@@ -1,7 +1,7 @@
 ; VI for the Commander X16  (Prog8, target cx16)
 ;
 ; A small vi clone with syntax highlighting for C, BASIC, 6502 assembly and Prog8.
-; This is a port of vi.c (cc65) to Prog8; the two behave the same.
+; (It started life as a C / cc65 program; Prog8 gives smaller, faster code.)
 ;
 ; HOW IT WORKS
 ;   * The whole file lives in one flat byte buffer `buf` (lines end in $0A, ASCII).
@@ -32,7 +32,7 @@
 ;     to 256 elements, so big buffers are done this way).
 ;   * Sub-routine variables are static (no recursion), so nothing here is recursive.
 ;
-; Build:  make p8      Run:  make runp8   (x16emu)      Usage: run it, then :e file
+; Build:  make         Run:  make run     (x16emu)      Usage: run it, then :e file
 
 %import syslib
 %zeropage basicsafe
@@ -237,7 +237,7 @@ main {
     ; low level: keyboard, VERA
     ; ---------------------------------------------------------------
     ; Wait for a key and return it (ISO/ASCII, cursor keys are the usual PETSCII codes).
-    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest_p8.sh to feed scripted keys.
+    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK

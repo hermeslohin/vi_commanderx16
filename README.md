@@ -1,14 +1,15 @@
 # VI for the Commander X16
 
-A small vi clone written in C (cc65) with syntax highlighting for **C**, **BASIC**, **6502 assembly** and **Prog8**.
+A small vi clone written in [Prog8](https://prog8.readthedocs.io/) with syntax highlighting for **C**, **BASIC**, **6502 assembly** and **Prog8**.
 It draws directly into VERA text memory in ISO mode, so files are plain ASCII.
 
 ## Build / run
 
-Requires [cc65](https://cc65.github.io/) and the [x16emu](https://github.com/X16Community/x16-emulator) emulator
+Requires the [Prog8](https://github.com/irmen/prog8/releases) compiler (`prog8c-12.x-all.jar`, needs Java; put it at
+`~/prog8c.jar` or set `PROG8C`) and the [x16emu](https://github.com/X16Community/x16-emulator) emulator
 (paths are set at the top of the `Makefile`). A prebuilt `VI.PRG` is included.
 
-    make            # -> VI.PRG        (needs cc65: cl65)
+    make            # -> VI.PRG
     make run        # runs it in x16emu with this folder as the SD card root
 
 On the X16: `LOAD "VI.PRG"` then `RUN`.
@@ -68,19 +69,14 @@ Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to li
 
 ## Limits
 
-* The text buffer lives in main RAM: **about 9000 bytes / 500 lines** (the editor itself uses most of the ~38 KB).
+* The text buffer lives in main RAM: **about 7500 bytes / 500 lines** (the editor itself uses most of the ~38 KB).
   Larger files are truncated on load and `:w` is refused until you force it with `:w!`.
 * Undo is single level (a snapshot kept in banked RAM, banks 1-8).
 * BASIC keywords are only highlighted as whole words (`FOR I=1 TO 10`, not `FORI=1TO10`).
 
 ## Self test
 
-`./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes, dumps the VERA
-screen (characters and colour indexes) to `tests/scr.out` and prints it. Sample sources are in `tests/`.
-
-## Prog8 port
-
-`vi.p8` is a Prog8 port of the editor (same keys and commands; `u` undo/redo, `:s` substitute and
-Prog8 highlighting are all in it). Build with `make p8` (needs `~/prog8c.jar`, Prog8 12.x) -> `p8build/vi.prg`,
-or `make runp8`. The Prog8 runtime is larger than cc65's, so its buffer is about **7500 bytes**.
-`./runtest_p8.sh '<keys>' [rows]` is the scripted-key screen test (`TESTFILE=test.p8` picks the file to open).
+`./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes (`\x1b` = Esc, `\r` = Enter), dumps the
+VERA screen (characters and colour indexes) to `tests/scr.out` and prints it. `TESTFILE=test.p8 ./runtest.sh ...`
+picks the file to open from `tests/` (default `test.c`; samples for every highlighted language are there).
+It uses `~/prog8c.jar` unless `PROG8C` is set.
