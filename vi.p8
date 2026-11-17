@@ -237,7 +237,7 @@ main {
     ; low level: keyboard, VERA
     ; ---------------------------------------------------------------
     ; Wait for a key and return it (ISO/ASCII, cursor keys are the usual PETSCII codes).
-    ; The `;@SELFTEST-HOOK` line below is replaced by runtest_p8.sh to feed scripted keys.
+    ; The line below marked SELFTEST-HOOK (a comment) is swapped in by runtest_p8.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK

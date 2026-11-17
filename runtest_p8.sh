@@ -55,7 +55,9 @@ s=s.replace(';@SELFTEST-SUBS','''uword selfkeys = &keystr
 s=s.replace(';@SELFTEST-INIT','open_file(iso:"%s")'%__import__('os').environ.get('TESTFILE','test.c'))
 open('build_test/vit.p8','w').write(s)
 PY
-cd build_test && java -jar "$J" -target cx16 vit.p8 2>&1 | grep -E "ERROR" ; cd ..
+rm -f build_test/vit.prg
+(cd build_test && java -jar "$J" -target cx16 vit.p8 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "ERROR|error")
+[ -f build_test/vit.prg ] || { echo "build failed"; exit 1; }
 rm -f tests/scr.out
 (/usr/local/x16emu/x16emu -rom /usr/local/x16emu/rom.bin -fsroot tests -prg build_test/vit.prg -run -warp >emu.log 2>&1 &)
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 1; [ -s tests/scr.out ] && sleep 1 && break; done
