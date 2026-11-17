@@ -1,10 +1,38 @@
 ; VI for the Commander X16  (Prog8, target cx16)
 ;
-; A small vi clone with syntax highlighting for C, BASIC and 6502 assembly.
-; Draws straight into VERA text memory in ISO mode (screen code == ASCII).
-; This is a port of vi.c (cc65).
+; A small vi clone with syntax highlighting for C, BASIC, 6502 assembly and Prog8.
+; This is a port of vi.c (cc65) to Prog8; the two behave the same.
 ;
-; Build:  make vi        Run:  make runp8   (x16emu)   Usage: vi.prg, then :e file
+; HOW IT WORKS
+;   * The whole file lives in one flat byte buffer `buf` (lines end in $0A, ASCII).
+;     `lstart` is a table with the offset where each line begins, plus one extra
+;     entry for 'end of last line', so line l is buf[lstart[l] .. lstart[l+1]-2].
+;     Every insert/delete shifts the tail of the buffer and patches `lstart`.
+;   * The screen is drawn by writing character/colour pairs straight into VERA's
+;     text map. The X16 is put in ISO mode ($0F), so a screen code is plain ASCII.
+;   * Syntax colouring is done per line when it is drawn: highlight() fills the
+;     `cls` array with one colour per character. C and Prog8 need one bit of state
+;     carried from line to line (inside a /* */ comment or an %asm block); those
+;     bits are cached in `cstate` and recomputed lazily (see line_state()).
+;   * Undo keeps ONE snapshot of the whole buffer in banked RAM (banks 1-8) and
+;     swaps with it, so pressing `u` again redoes.
+;   * Input is a blocking getkey(); the editor is a set of nested loops
+;     (editor -> normal_key -> insert_loop/operator_cmd ...) rather than a state machine.
+;
+; CODE MAP (top to bottom)
+;   configuration & state  ->  small helpers  ->  keyboard & VERA  ->  buffer & lines
+;   ->  undo  ->  syntax highlighting  ->  drawing  ->  cursor & motion helpers
+;   ->  yank / search / bracket match  ->  file I/O  ->  ':' commands  ->  insert mode
+;   ->  normal mode  ->  editor loop and start()
+;
+; NOTES FOR READERS NEW TO PROG8
+;   * `iso:"text"` / `iso:'c'` are ASCII literals; plain "text" would be PETSCII.
+;   * `@(addr)` reads or writes one byte of memory; `peekw/pokew` do 16-bit words.
+;   * `memory(name,size,align)` reserves an uninitialised RAM slab (arrays are limited
+;     to 256 elements, so big buffers are done this way).
+;   * Sub-routine variables are static (no recursion), so nothing here is recursive.
+;
+; Build:  make p8      Run:  make runp8   (x16emu)      Usage: run it, then :e file
 
 %import syslib
 %zeropage basicsafe
@@ -50,11 +78,13 @@ main {
     ; ---------------------------------------------------------------
     ; state
     ; ---------------------------------------------------------------
+    ; Text buffer and tables live in raw RAM slabs (see header). Sizes are BUFSZ+2 so a
+    ; trailing newline always fits; the line table holds MAXL+2 16-bit offsets.
     uword buf    = memory("buf", 7502, 0)
     uword lstart = memory("lstart", 1004, 0)     ; uword per line start
     uword cstate = memory("cstate", 70, 0)       ; 1 bit per line: starts inside /* */
 
-    uword blen
+    uword blen           ; number of bytes of text in buf
     uword nlines
     uword cy             ; cursor line
     uword cx             ; cursor column (char index in line)
@@ -108,6 +138,7 @@ main {
     ; ---------------------------------------------------------------
     ; small helpers (string / memory)
     ; ---------------------------------------------------------------
+    ; Length of a NUL-terminated string (max 255).
     sub slen(uword s) -> ubyte {
         ubyte n = 0
         while @(s + n) != 0
@@ -115,6 +146,7 @@ main {
         return n
     }
 
+    ; Copy a NUL-terminated string, at most maxn characters, always NUL-terminating dst.
     sub copystr(uword dst, uword src, ubyte maxn) {
         ubyte n = 0
         while @(src + n) != 0 and n < maxn {
@@ -124,6 +156,7 @@ main {
         @(dst + n) = 0
     }
 
+    ; Append src to the end of the NUL-terminated string dst.
     sub appendstr(uword dst, uword src) {
         ubyte n = slen(dst)
         ubyte i = 0
@@ -135,6 +168,7 @@ main {
         @(dst + n) = 0
     }
 
+    ; True if the two NUL-terminated strings are identical.
     sub streq(uword a, uword b) -> bool {
         ubyte i = 0
         while @(a + i) == @(b + i) {
@@ -145,7 +179,7 @@ main {
         return false
     }
 
-    ; true if string a starts with n chars of b
+    ; True if the first n characters of a and b are identical.
     sub strneq(uword a, uword b, ubyte n) -> bool {
         ubyte i = 0
         while i < n {
@@ -156,6 +190,7 @@ main {
         return true
     }
 
+    ; True if n bytes at a and b are identical.
     sub memeq(uword a, uword b, uword n) -> bool {
         uword i = 0
         while i < n {
@@ -166,18 +201,22 @@ main {
         return true
     }
 
+    ; Set the message shown on the status line (truncated to 79 characters).
     sub setmsg(uword s) {
         copystr(&msg, s, 79)
     }
 
+    ; Line-start table accessors: ls(i) is the buffer offset where line i begins.
     sub ls(uword i) -> uword {
         return peekw(lstart + (i << 1))
     }
 
+    ; Store a line-start offset (the table is 16-bit values kept in a raw RAM slab).
     sub setls(uword i, uword v) {
         pokew(lstart + (i << 1), v)
     }
 
+    ; Character class helpers used by the tokenisers and the editor.
     sub is_digit(ubyte c) -> bool {
         return c >= '0' and c <= '9'
     }
@@ -197,6 +236,8 @@ main {
     ; ---------------------------------------------------------------
     ; low level: keyboard, VERA
     ; ---------------------------------------------------------------
+    ; Wait for a key and return it (ISO/ASCII, cursor keys are the usual PETSCII codes).
+    ; The `;@SELFTEST-HOOK` line below is replaced by runtest_p8.sh to feed scripted keys.
     sub getkey() -> ubyte {
         ubyte k
         ;@SELFTEST-HOOK
@@ -208,22 +249,28 @@ main {
         return k
     }
 
+    ; Point VERA data port 0 at the text-map cell (x,y) with auto-increment 1,
+    ; so successive writes fill: char, colour, char, colour ... across the row.
     sub vera_at(ubyte x, ubyte y) {
         cx16.VERA_CTRL &= $fe
         cx16.VERA_ADDR = vbase + (y as uword) * vstride + (x as uword) * 2
         cx16.VERA_ADDR_H = $11          ; increment 1, bank 1 ($1xxxx)
     }
 
+    ; Write one character + colour attribute at (x,y). Colour byte = background<<4 | foreground.
     sub put_cell(ubyte x, ubyte y, ubyte ch, ubyte col) {
         vera_at(x, y)
         cx16.VERA_DATA0 = ch
         cx16.VERA_DATA0 = col
     }
 
+    ; Switch the X16 console to ISO mode so screen codes equal ASCII.
     sub iso_mode() {
         cbm.CHROUT($0f)
     }
 
+    ; Read the screen size from the KERNAL and work out where VERA keeps the text map
+    ; (layer 1): map width in bytes per row (vstride) and the map's base address (vbase).
     sub init_screen() {
         ubyte m
         scrw, scrh = cbm.SCREEN()
@@ -243,10 +290,12 @@ main {
     ; ---------------------------------------------------------------
     ; buffer / lines
     ; ---------------------------------------------------------------
+    ; Number of characters in line l (not counting its newline).
     sub linelen(uword l) -> uword {
         return ls(l + 1) - ls(l) - 1
     }
 
+    ; Binary search: which line contains buffer offset pos?
     sub find_line(uword pos) -> uword {
         uword lo = 0
         uword hi = nlines
@@ -261,6 +310,8 @@ main {
         return lo
     }
 
+    ; Rescan the whole buffer and rebuild the line-start table (after load / undo).
+    ; Stops at MAXL lines. Also invalidates the cached comment state.
     sub rebuild_lines() {
         uword i
         nlines = 0
@@ -278,6 +329,7 @@ main {
         cstate_valid = 0
     }
 
+    ; Reset to an empty document (a single newline) and home the cursor.
     sub new_buffer() {
         @(buf) = NL
         blen = 1
@@ -291,6 +343,9 @@ main {
         uvalid = false
     }
 
+    ; Insert n bytes from src at buffer offset pos. Shifts the tail up, patches the
+    ; line-start table (adding entries for any newlines inserted) and returns false
+    ; (with a message) if the buffer or the line table would overflow.
     sub buf_insert(uword pos, uword src, uword n) -> bool {
         uword L
         uword k = 0
@@ -345,6 +400,8 @@ main {
         return true
     }
 
+    ; Delete n bytes at pos. The buffer's final newline is never removed. Shifts the
+    ; tail down and patches the line-start table.
     sub buf_delete(uword pos, uword n) {
         uword L
         uword k = 0
@@ -383,6 +440,9 @@ main {
     ; ---------------------------------------------------------------
     ; undo snapshots in banked RAM (banks 1-4 and 5-8)
     ; ---------------------------------------------------------------
+    ; Undo storage. A snapshot is the raw buffer copied into banked RAM at $A000,
+    ; 8 KB per bank: snapshot set 0 uses banks 1-4, set 1 uses banks 5-8.
+    ; bank_save copies the current buffer into set `set`.
     sub bank_save(ubyte set) {
         uword off = 0
         uword n
@@ -399,6 +459,7 @@ main {
         cx16.rambank(0)
     }
 
+    ; Copy a saved snapshot (n_total bytes) from banked RAM back into the buffer.
     sub bank_load(ubyte set, uword n_total) {
         uword off = 0
         uword n
@@ -415,6 +476,7 @@ main {
         cx16.rambank(0)
     }
 
+    ; Take an undo snapshot of the current state; call this BEFORE every change.
     sub snap() {
         bank_save(usel)
         smeta_len[usel] = blen
@@ -423,6 +485,8 @@ main {
         uvalid = true
     }
 
+    ; `u`: swap the current buffer with the saved snapshot. Because the current state is
+    ; saved into the other slot first, pressing `u` twice returns to where you were (redo).
     sub do_undo() {
         ubyte other = 1 - usel
         if not uvalid {
@@ -448,7 +512,9 @@ main {
     ; ---------------------------------------------------------------
     ; syntax highlighting
     ; ---------------------------------------------------------------
-    ; word lists: space separated, each word followed by a space
+    ; Keyword tables for the highlighters. Each string is a list of space-separated
+    ; words with a trailing space (Prog8 strings are limited to 255 characters, so the
+    ; longer lists are split across several strings). All matching is done lower-case.
     str kw_c = iso:"asm auto break case const continue default do else enum extern for goto if register return sizeof static struct switch typedef union volatile while "
     str ty_c = iso:"char double float int long short signed unsigned void int8_t int16_t int32_t uint8_t uint16_t uint32_t size_t bool FILE NULL true false BYTE WORD "
 
@@ -465,7 +531,8 @@ main {
     str ty_p81 = iso:"ubyte byte uword word long float str bool peek poke peekw pokew peekf pokef memory len lsb msb abs sqrt sgn min max sort reverse any all sizeof "
     str ty_p82 = iso:"rol ror rol2 ror2 swap push pop pushw popw cmp divmod mkword setlsb setmsb callfar callfar2 rsave rrestore clamp lsl lsr sin cos tan atn ln log2 floor ceil round rnd rndw rndf "
 
-    ; w: NUL terminated word
+    ; Is the NUL-terminated word w one of the words in `list`?
+    ; Lists are strings of space-separated words with a trailing space, e.g. "if else ".
     sub in_list(uword list, uword w) -> bool {
         uword p = list
         ubyte i
@@ -483,7 +550,8 @@ main {
         return false
     }
 
-    ; copy word, lower-cased, into wbuf (max 14 chars)
+    ; Copy the identifier starting at s[i] into wbuf, lower-cased (max 14 chars).
+    ; With extra=true, BASIC's $ and % type suffixes count as part of the word.
     sub getword(uword s, ubyte n, ubyte i, bool extra) {
         ubyte k = 0
         ubyte c
@@ -500,6 +568,7 @@ main {
         wbuf[k] = 0
     }
 
+    ; Give characters fstart..fend-1 of the current line the colour class `col`.
     sub fillc(ubyte fstart, ubyte fend, ubyte col) {
         while fstart < fend {
             cls[fstart] = col
@@ -507,6 +576,10 @@ main {
         }
     }
 
+    ; Colour one line of C. s = line text, n = length, st = state at the start of the line
+    ; (bit 0 set = we are inside a /* */ comment). Returns the state at the end of the line.
+    ; Handles // and /* */ comments, strings and chars, #preprocessor lines, <header.h>,
+    ; numbers, keywords and types. Colours go into the `cls` array.
     sub hl_c(uword s, ubyte n, ubyte st) -> ubyte {
         ubyte i = 0
         ubyte j
@@ -641,6 +714,8 @@ main {
         return st
     }
 
+    ; Colour one line of Commander X16 BASIC: leading line number, strings, numbers
+    ; ($hex too), keywords, functions, and REM comments. BASIC has no multi-line state.
     sub hl_bas(uword s, ubyte n, ubyte st) -> ubyte {
         ubyte i = 0
         ubyte j
@@ -706,6 +781,9 @@ main {
         return st
     }
 
+    ; Colour one line of 65C02 assembly: a label at column 0, `;` comments, strings,
+    ; $hex/%bin/decimal numbers, .directives, mnemonics (first word after the label),
+    ; and the A/X/Y registers used as operands.
     sub hl_asm(uword s, ubyte n, ubyte st) -> ubyte {
         ubyte i = 0
         ubyte j
@@ -812,8 +890,10 @@ main {
         return st
     }
 
-    ; Prog8: ';' comments, strings with optional encoding prefix, $hex %bin numbers,
-    ; %directives, and %asm {{ ... }} blocks (highlighted as assembly, state bit 0)
+    ; Colour one line of Prog8: `;` comments, strings (with encoding prefixes like iso:),
+    ; $hex / %bin numbers, %directives, keywords, types and builtin functions.
+    ; A `%asm {{ ... }}` block spans lines: bit 0 of the state means 'inside the block',
+    ; and those lines are coloured with hl_asm(). Returns the state at the end of the line.
     sub hl_p8(uword s, ubyte n, ubyte st) -> ubyte {
         ubyte i = 0
         ubyte j
@@ -941,6 +1021,8 @@ main {
         return st
     }
 
+    ; Colour line s (n16 chars) for the current language. Fills cls[0..n]; returns the
+    ; end-of-line state. Only the first 255 characters of a line are coloured.
     sub highlight(uword s, uword n16, ubyte st) -> ubyte {
         ubyte n
         ubyte k
@@ -964,7 +1046,9 @@ main {
         return st
     }
 
-    ; line begin state (only C needs it)
+    ; State (see hl_c) at the START of line l. C/Prog8 need it for multi-line constructs.
+    ; cstate holds one cached bit per line; we extend the cache by highlighting forward
+    ; from cstate_valid, so an edit only invalidates the lines below it.
     sub line_state(uword l) -> ubyte {
         ubyte st
         ubyte bit
@@ -999,6 +1083,7 @@ main {
     str extlist = iso:"c h bas bi asm s inc a65 a p8 prog8 "
     ubyte[11] extlang = [L_C, L_C, L_BAS, L_BAS, L_ASM, L_ASM, L_ASM, L_ASM, L_ASM, L_P8, L_P8]
 
+    ; Choose the highlighting language from the file extension (case-insensitive).
     sub detect_lang(uword name) {
         ubyte dot = 255
         ubyte i = 0
@@ -1039,6 +1124,7 @@ main {
     ; helper: a one-word list (for matching a single extension)
     ubyte[10] extword
 
+    ; Helper for detect_lang: build a one-word list for extension number idx.
     sub extlist_single(ubyte idx) -> uword {
         ; find word number idx in extlist and copy it (plus trailing space) to extword
         uword p = extlist
@@ -1063,6 +1149,7 @@ main {
     ; ---------------------------------------------------------------
     ; drawing
     ; ---------------------------------------------------------------
+    ; Screen column of character index `upto` in line l, expanding tabs to the tab width.
     sub visual_col(uword l, uword upto) -> uword {
         uword s = buf + ls(l)
         uword i = 0
@@ -1077,12 +1164,14 @@ main {
         return v
     }
 
+    ; Width of the line-number gutter (0 when :set nonu).
     sub gutter() -> ubyte {
         if shownum
             return 5
         return 0
     }
 
+    ; Draw a NUL-terminated string on a full screen row, padding with spaces.
     sub draw_text(ubyte row, uword s, ubyte col) {
         ubyte x = 0
         vera_at(0, row)
@@ -1099,6 +1188,8 @@ main {
 
     ubyte[6] nb
 
+    ; Draw text-area row `row`: the line at top+row with syntax colours, tabs expanded and
+    ; horizontal scroll applied; past the end of the file it draws a `~` like vi.
     sub draw_row(ubyte row) {
         uword l = top + row
         ubyte g = gutter()
@@ -1194,11 +1285,12 @@ main {
         }
     }
 
+    ; Screen column of the cursor.
     sub cursor_scrx() -> ubyte {
         return lsb(visual_col(cy, cx) - leftcol) + gutter()
     }
 
-    ; append src to line at d, return new position
+    ; Append src to sline at offset d; returns the new offset.
     sub scat(ubyte d, uword src) -> ubyte {
         while @(src) != 0 {
             sline[d] = @(src)
@@ -1211,7 +1303,7 @@ main {
     ubyte[84] sline
     ubyte[24] rbuf
 
-    ; write decimal v at rbuf[e], return new e
+    ; Append the decimal number v to rbuf at offset e; returns the new offset.
     sub rnum(ubyte e, uword v) -> ubyte {
         ubyte[6] tmp
         ubyte t = 0
@@ -1230,6 +1322,8 @@ main {
         return e
     }
 
+    ; Draw the bottom line. With cmdline set it shows the `:` / `/` prompt instead;
+    ; otherwise mode or file name on the left and language, line,column on the right.
     sub draw_status(uword cmdline) {
         ubyte d = 0
         ubyte e
@@ -1309,6 +1403,8 @@ main {
         draw_text(scrh - 1, &sline, (C_NORM << 4) | C_BG)
     }
 
+    ; Show the cursor by inverting the colours of the cell under it
+    ; (block in normal mode, a different colour in insert/replace).
     sub place_cursor() {
         ubyte x = cursor_scrx()
         ubyte y = lsb(cy - top)
@@ -1323,6 +1419,7 @@ main {
         put_cell(x, y, ch, col)
     }
 
+    ; Adjust top / leftcol so the cursor is visible. center=true puts it mid-screen.
     sub scroll_to_cursor(bool center) {
         uword vc = visual_col(cy, cx)
         ubyte g = gutter()
@@ -1353,6 +1450,8 @@ main {
         }
     }
 
+    ; Redraw what changed (everything if redraw_all is set, otherwise just the line we
+    ; left and the line we are on), then the status line and the cursor.
     sub refresh(bool center) {
         ubyte r
         scroll_to_cursor(center)
@@ -1376,6 +1475,7 @@ main {
     ; ---------------------------------------------------------------
     ; cursor helpers
     ; ---------------------------------------------------------------
+    ; Keep the cursor on the line: in normal mode it cannot sit past the last character.
     sub clamp_cx() {
         uword n = linelen(cy)
         uword maxx
@@ -1387,10 +1487,12 @@ main {
             cx = maxx
     }
 
+    ; Remember the cursor's screen column so j/k can return to it on shorter lines.
     sub set_want() {
         want = visual_col(cy, cx)
     }
 
+    ; Move cx on the current line to the character nearest the remembered column.
     sub apply_want() {
         uword n = linelen(cy)
         uword i = 0
@@ -1411,6 +1513,7 @@ main {
         clamp_cx()
     }
 
+    ; Jump to line l (clamped) and put the cursor on its first non-blank character.
     sub goto_line(uword l) {
         uword s
         uword n
@@ -1426,6 +1529,7 @@ main {
         set_want()
     }
 
+    ; j: down n lines, keeping the wanted column.
     sub move_down(uword n) {
         if cy + n >= nlines
             cy = nlines - 1
@@ -1434,6 +1538,7 @@ main {
         apply_want()
     }
 
+    ; k: up n lines, keeping the wanted column.
     sub move_up(uword n) {
         if n > cy
             cy = 0
@@ -1442,14 +1547,17 @@ main {
         apply_want()
     }
 
+    ; A 'word' character for w/b motions: letter, digit or underscore.
     sub is_word(ubyte c) -> bool {
         return is_idchar(c)
     }
 
+    ; Buffer offset of the cursor.
     sub cur_pos() -> uword {
         return ls(cy) + cx
     }
 
+    ; Place the cursor at buffer offset pos.
     sub set_pos(uword pos) {
         cy = find_line(pos)
         cx = pos - ls(cy)
@@ -1457,6 +1565,7 @@ main {
         set_want()
     }
 
+    ; Offset of the start of the next word after p (vi's `w`).
     sub word_fwd(uword p) -> uword {
         ubyte c
         if p >= blen - 1
@@ -1479,6 +1588,7 @@ main {
         return p
     }
 
+    ; Offset of the start of the word before p (vi's `b`).
     sub word_back(uword p) -> uword {
         if p == 0
             return 0
@@ -1498,6 +1608,7 @@ main {
     ; ---------------------------------------------------------------
     ; register (yank) handling
     ; ---------------------------------------------------------------
+    ; Copy buffer[a..b) into the register (the paste buffer). linewise = whole lines.
     sub yank_range(uword a, uword b, bool linewise) {
         uword n = b - a
         if n > REGSZ {
@@ -1509,6 +1620,7 @@ main {
         reglines = linewise
     }
 
+    ; Yank buffer[a..b) into the register, then delete it (vi's `d`).
     sub delete_range(uword a, uword b, bool linewise) {
         yank_range(a, b, linewise)
         buf_delete(a, b - a)
@@ -1517,6 +1629,7 @@ main {
     uword lr_a
     uword lr_b
 
+    ; For cnt lines starting at l, set lr_a/lr_b to the buffer range they cover.
     sub line_range(uword l, uword cnt) {
         uword last = l + cnt
         if last > nlines
@@ -1528,6 +1641,8 @@ main {
     ; ---------------------------------------------------------------
     ; search
     ; ---------------------------------------------------------------
+    ; Search for `lastsearch` (a plain string, no regex) from the cursor, wrapping around the
+    ; file. dir = +1 forward, -1 backward. Moves the cursor and returns true if found.
     sub do_search(byte dir, bool from_next) -> bool {
         uword plen = slen(&lastsearch)
         uword p
@@ -1572,6 +1687,7 @@ main {
         return false
     }
 
+    ; `%`: jump to the bracket matching the one under the cursor, counting nesting.
     sub match_bracket() {
         uword p = cur_pos()
         uword q
@@ -1632,7 +1748,7 @@ main {
     ; ---------------------------------------------------------------
     ; file I/O
     ; ---------------------------------------------------------------
-    ; CMDR-DOS wants PETSCII style names: a-z -> $41-$5A, A-Z -> $C1-$DA
+    ; CMDR-DOS wants PETSCII file names: convert ASCII in place (a-z -> $41-$5A, A-Z -> $C1-$DA).
     sub dosname(uword d) {
         ubyte c
         while @(d) != 0 {
@@ -1648,6 +1764,7 @@ main {
 
     ubyte[40] dstat
 
+    ; Read the drive's status line (e.g. "62,file not found,00,00") via channel 15.
     sub dos_status(uword out, ubyte maxn) {
         ubyte n = 0
         ubyte c
@@ -1676,6 +1793,9 @@ main {
         cbm.CLOSE(15)
     }
 
+    ; Load a file into the buffer (device 8). Converts CR / CRLF to LF, drops NULs, makes
+    ; sure the text ends in a newline and sets `truncated` if it did not fit.
+    ; Returns false (and a message) if the file could not be read.
     sub load_file(uword name) -> bool {
         uword o = 0
         ubyte c
@@ -1734,6 +1854,8 @@ main {
         return true
     }
 
+    ; Write the buffer to a file, replacing it (the `@:` prefix means overwrite).
+    ; Reports the drive's status if it is not "00".
     sub save_file(uword name) -> bool {
         uword o = 0
         ubyte c
@@ -1765,6 +1887,7 @@ main {
         return true
     }
 
+    ; `:e name`: load a file, reset the cursor and undo state, and pick the syntax language.
     sub open_file(uword name) {
         bool ok
         copystr(&fname, name, FNLEN)
@@ -1794,6 +1917,8 @@ main {
     ; ---------------------------------------------------------------
     ubyte[84] rline
 
+    ; Prompt on the bottom line and read a line of text with simple editing (backspace, Esc
+    ; cancels). prompt is the leading character (':' or '/' or '?'). Returns false if cancelled.
     sub read_line(ubyte prompt, uword out, ubyte maxn) -> bool {
         ubyte n = 0
         ubyte k
@@ -1837,6 +1962,7 @@ main {
     ; ---------------------------------------------------------------
     uword pp          ; parse pointer
 
+    ; Read a decimal number at the command parse pointer pp, advancing past it.
     sub parse_num() -> uword {
         uword v = 0
         while is_digit(@(pp)) {
@@ -1848,6 +1974,7 @@ main {
 
     ubyte[12] cword
 
+    ; `:set syntax=...` / `:syntax ...`: choose the highlighting language by name.
     sub set_syntax(uword v) {
         if streq(v, iso:"c")
             lang = L_C
@@ -1866,7 +1993,11 @@ main {
     ubyte[32] spat
     ubyte[32] srep
 
-    ; :[range]s/old/new/[g]   (pp points at the delimiter)
+    ; `:[range]s/old/new/[g]` -- plain-text substitute (no regular expressions).
+    ; pp points at the delimiter after the `s`. Any delimiter works; `\x` gives a literal x.
+    ; Without g only the first match on each line is replaced. The whole substitute is one
+    ; undo step, the replacement is inserted before the old text is removed (so a full
+    ; buffer leaves the text untouched), and the cursor ends on the last changed line.
     sub do_subst(uword l1, uword l2) {
         ubyte delim = @(pp)
         ubyte n
@@ -1984,6 +2115,9 @@ main {
         redraw_all = true
     }
 
+    ; Parse and run an ex command typed after `:`. Syntax: [range] word[!] arguments, where the
+    ; range is %, N, $, ., or N,M. Supports w q wq x e s set syntax help and a bare
+    ; line number (go to line).
     sub exec_cmd(uword cmd) {
         uword l1 = 0
         uword l2 = 0
@@ -2134,6 +2268,7 @@ main {
     ; ---------------------------------------------------------------
     ; insert mode
     ; ---------------------------------------------------------------
+    ; Insert one character at the cursor and advance.
     sub insert_char(ubyte c) {
         chbuf[0] = c
         if buf_insert(cur_pos(), &chbuf, 1)
@@ -2142,6 +2277,7 @@ main {
 
     ubyte[40] ins
 
+    ; Enter in insert mode: split the line, copying leading whitespace if autoindent is on.
     sub do_newline() {
         ubyte n = 1
         uword s
@@ -2162,6 +2298,8 @@ main {
         }
     }
 
+    ; Insert mode: read keys and edit until Esc. Handles Enter, backspace/delete, cursor
+    ; keys and printable characters. On exit the cursor steps back one, like vi.
     sub insert_loop() {
         ubyte k
         repeat {
@@ -2222,6 +2360,7 @@ main {
         set_want()
     }
 
+    ; Replace mode (`R`): each typed character overwrites the one under the cursor.
     sub replace_loop() {
         ubyte k
         repeat {
@@ -2251,6 +2390,7 @@ main {
         set_want()
     }
 
+    ; Enter insert mode.
     sub start_insert() {
         mode = 1
         msg[0] = 0
@@ -2260,6 +2400,7 @@ main {
     ; ---------------------------------------------------------------
     ; normal mode
     ; ---------------------------------------------------------------
+    ; `o` / `O`: open a new (auto-indented) line below/above and enter insert mode.
     sub open_line(bool below) {
         uword pos
         ubyte n = 0
@@ -2298,6 +2439,8 @@ main {
         }
     }
 
+    ; `p` / `P`: paste the register `count` times. Whole-line registers go on a new line
+    ; below/above; character registers go after/before the cursor.
     sub paste(bool after, uword count) {
         uword pos
         uword c
@@ -2343,6 +2486,7 @@ main {
         }
     }
 
+    ; `J`: join count lines, collapsing the leading blanks of each into one space.
     sub join_lines(uword count) {
         uword c
         uword pos
@@ -2368,7 +2512,9 @@ main {
         set_want()
     }
 
-    ; run an operator (d/c/y) over a motion
+    ; Operators d (delete), c (change), y (yank): read an optional count and a motion
+    ; (w b $ 0 ^ l h) or the same key again for whole lines (dd, cc, yy), then apply
+    ; the operator to the range the motion covers.
     sub operator_cmd(ubyte op, uword count) {
         ubyte k
         bool mcount_set = false
@@ -2521,6 +2667,9 @@ main {
     ubyte[32] tsearch
     ubyte[70] tcmd
 
+    ; Execute one normal-mode command. k is the key, count the numeric prefix (0 = none).
+    ; Covers motions, search, entering insert mode, the single-key edits (x X D C s r J),
+    ; the operators, paste, undo, ZZ/ZQ and the `:` prompt.
     sub normal_key(ubyte k, uword count) {
         uword c
         uword n
@@ -2765,6 +2914,7 @@ main {
     }
 
     ; ---------------------------------------------------------------
+    ; Main loop: redraw, read a key, collect a numeric prefix, run the command; until :q etc.
     sub editor() {
         ubyte k
         uword count
@@ -2807,6 +2957,7 @@ main {
 
     ;@SELFTEST-SUBS
 
+    ; Program entry: set up the screen, run the editor, then restore the console on exit.
     sub start() {
         ubyte x
         ubyte y
