@@ -18,7 +18,7 @@ VI.PRG: vi.p8
 # wants it) goes into VI.ARG, which the program reads at start-up; it is removed afterwards.
 run: VI.PRG
 	@if [ -n "$(FILE)" ]; then echo "$(FILE)" | tr 'A-Z' 'a-z' > VI.ARG; fi; \
-	$(X16) -rom $(ROM) -fsroot $(CURDIR) -prg VI.PRG -run; rm -f VI.ARG
+	$(X16) -ram 2048 -rom $(ROM) -fsroot $(CURDIR) -prg VI.PRG -run; rm -f VI.ARG
 
 clean:
 	rm -rf p8build build_test

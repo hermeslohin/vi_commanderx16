@@ -4,18 +4,18 @@
 ; (It started life as a C / cc65 program; Prog8 gives smaller, faster code.)
 ;
 ; HOW IT WORKS
-;   * The whole file lives in one flat byte buffer `buf` (lines end in $0A, ASCII).
-;     `lstart` is a table with the offset where each line begins, plus one extra
-;     entry for 'end of last line', so line l is buf[lstart[l] .. lstart[l+1]-2].
-;     Every insert/delete shifts the tail of the buffer and patches `lstart`.
+;   * The file lives in BANKED RAM, not main RAM: a chain of 2 KB pages (runs of whole lines)
+;     with one page-sized window in main RAM. Lines are addressed by number through
+;     lp(l) / linelen(l); every edit goes through splice(). See "paged document store".
+;     That allows ~1 MB / tens of thousands of lines on a 2 MB machine.
 ;   * The screen is drawn by writing character/colour pairs straight into VERA's
 ;     text map. The X16 is put in ISO mode ($0F), so a screen code is plain ASCII.
 ;   * Syntax colouring is done per line when it is drawn: highlight() fills the
 ;     `cls` array with one colour per character. C and Prog8 need one bit of state
 ;     carried from line to line (inside a /* */ comment or an %asm block); those
-;     bits are cached in `cstate` and recomputed lazily (see line_state()).
-;   * Undo keeps ONE snapshot of the whole buffer in banked RAM (banks 1-8) and
-;     swaps with it, so pressing `u` again redoes.
+;     bits are cached in banked RAM (bank 2) and recomputed lazily with a fast scanner (see line_state()).
+;   * Undo keeps ONE level: a copy of the (small) page table; pages are copied only when
+;     first edited. `u` swaps with it, so pressing `u` again redoes.
 ;   * Input is a blocking getkey(); the editor is a set of nested loops
 ;     (editor -> normal_key -> insert_loop/operator_cmd ...) rather than a state machine.
 ;
@@ -41,8 +41,20 @@ main {
     ; ---------------------------------------------------------------
     ; configuration
     ; ---------------------------------------------------------------
-    const uword BUFSZ  = 7500
-    const uword MAXL   = 500
+    const uword PG     = 2048         ; bytes in one document page (4 pages per 8K bank)
+    const uword MAXLN  = 700          ; longest line (a page must be able to hold it)
+    const ubyte LPP    = 160          ; most lines in one page
+    const uword PMAX   = 850          ; most physical pages
+    const uword NIL    = $ffff
+    const uword MAXLINES = 60000
+    const uword FILL   = 1800         ; the loader starts a new page when one is this full
+    const ubyte TBANK  = 1            ; bank 1 holds the page tables
+    const ubyte CSBANK = 2            ; bank 2 holds the syntax-state bits (1 per line)
+    const ubyte DOC_BANK0 = 3         ; document pages start at bank 3
+    const uword TSET   = $09fc        ; size of one table copy: NEXT (uword per page), then NL (ubyte per page)
+    const uword T_NL   = $06a8
+    const uword T_FLAGS = $13f8       ; per physical page: shared with the undo snapshot?
+    const uword T_FREE = $1750        ; stack of free physical pages
     const uword REGSZ  = 512
     const ubyte FNLEN  = 40
     const ubyte CMDLEN = 70
@@ -78,14 +90,29 @@ main {
     ; ---------------------------------------------------------------
     ; state
     ; ---------------------------------------------------------------
-    ; Text buffer and tables live in raw RAM slabs (see header). Sizes are BUFSZ+2 so a
-    ; trailing newline always fits; the line table holds MAXL+2 16-bit offsets.
-    uword buf    = memory("buf", 7502, 0)
-    uword lstart = memory("lstart", 1004, 0)     ; uword per line start
-    uword cstate = memory("cstate", 70, 0)       ; 1 bit per line: starts inside /* */
-
-    uword blen           ; number of bytes of text in buf
-    uword nlines
+    ; The page window and its line-start table are raw RAM slabs (see "paged document store").
+    uword pbuf = memory("pbuf", 2052, 0)         ; the one resident page
+    uword pls  = memory("pls", 332, 0)           ; its line-start offsets
+    uword jbuf = memory("jbuf", 704, 0)          ; scratch: joins across pages
+    uword c_pg                ; page held ($ffff = none)
+    uword c_fl                ;   its first line number
+    uword c_nl                ;   number of lines (0 = nothing resident)
+    uword c_bl                ;   bytes used
+    ubyte c_dirty             ;   changed since it was loaded?
+    uword f_li                ; result of fetch(): line index within the page
+    uword nbanks              ; RAM banks in this machine
+    ubyte db0                 ; first bank used for document pages
+    uword ndocpg              ; physical pages available
+    uword nfree               ; free physical pages
+    uword head                ; first page of the working chain
+    uword snap_head
+    uword snap_nlines
+    ubyte tsel                ; which table copy is the working one
+    uword wbase               ; its offset in bank 1
+    uword sbase               ; offset of the snapshot copy
+    uword sm_cx
+    uword sm_cy
+    uword nlines              ; lines in the document
     uword cy             ; cursor line
     uword cx             ; cursor column (char index in line)
     uword want           ; desired visual column for j/k
@@ -116,11 +143,7 @@ main {
     ubyte[32] lastsearch
     byte searchdir = 1
 
-    ; undo (single level, swap style) held in banked RAM
-    uword[2] smeta_len
-    uword[2] smeta_cx
-    uword[2] smeta_cy
-    ubyte usel
+    ; undo (single level, copy-on-write pages)
     bool uvalid
 
     uword cstate_valid
@@ -206,16 +229,6 @@ main {
         copystr(&msg, s, 79)
     }
 
-    ; Line-start table accessors: ls(i) is the buffer offset where line i begins.
-    sub ls(uword i) -> uword {
-        return peekw(lstart + (i << 1))
-    }
-
-    ; Store a line-start offset (the table is 16-bit values kept in a raw RAM slab).
-    sub setls(uword i, uword v) {
-        pokew(lstart + (i << 1), v)
-    }
-
     ; Character class helpers used by the tokenisers and the editor.
     sub is_digit(ubyte c) -> bool {
         return c >= '0' and c <= '9'
@@ -288,225 +301,531 @@ main {
     }
 
     ; ---------------------------------------------------------------
-    ; buffer / lines
+    ; paged document store
     ; ---------------------------------------------------------------
-    ; Number of characters in line l (not counting its newline).
-    sub linelen(uword l) -> uword {
-        return ls(l + 1) - ls(l) - 1
+    ; The document does NOT live in main RAM. It is a chain of PAGES kept in banked RAM (a page is
+    ; a run of whole lines, at most PG bytes and LPP lines; four pages fit in one 8 KB bank).
+    ; Main RAM only holds one page-sized WINDOW caching the page being looked at or edited.
+    ; Lines are addressed by line number everywhere:
+    ;     lp(l)       pointer to the text of line l (valid until another page has to be loaded)
+    ;     linelen(l)  its length
+    ; fetch(l) makes the page that holds line l resident (reading it from banked RAM, and writing
+    ; the page it replaces back first if that was changed). Pointers from lp() are therefore only
+    ; valid until the next call that touches another line.
+    ;
+    ; A page is identified by its physical page number g (a node of a linked list). Bank 1 holds,
+    ; for every g, the next page in document order (NEXT) and its line count (NL), in two copies:
+    ; "working" and "snapshot". Undo is copy-on-write on whole pages: snap() copies the (small)
+    ; arrays and marks every page shared; the first edit to a shared page moves the working
+    ; chain to a fresh copy. Ctrl-Z just swaps which copy is the working one.
+    ;
+    ; All edits go through splice() (replace some bytes of a line by other bytes); ed_insert,
+    ; del_chars, del_line and join_next are thin wrappers.
+
+    ; --- page tables (bank 1) ---
+    sub tb_get(uword off) -> uword {
+        uword v
+        cx16.rambank(TBANK)
+        v = peekw($a000 + off)
+        cx16.rambank(0)
+        return v
     }
 
-    ; Binary search: which line contains buffer offset pos?
-    sub find_line(uword pos) -> uword {
-        uword lo = 0
-        uword hi = nlines
-        uword mid
-        while hi - lo > 1 {
-            mid = (lo + hi) >> 1
-            if ls(mid) <= pos
-                lo = mid
-            else
-                hi = mid
+    sub tb_set(uword off, uword v) {
+        cx16.rambank(TBANK)
+        pokew($a000 + off, v)
+        cx16.rambank(0)
+    }
+
+    sub tb_getb(uword off) -> ubyte {
+        ubyte v
+        cx16.rambank(TBANK)
+        v = @($a000 + off)
+        cx16.rambank(0)
+        return v
+    }
+
+    sub tb_setb(uword off, ubyte v) {
+        cx16.rambank(TBANK)
+        @($a000 + off) = v
+        cx16.rambank(0)
+    }
+
+    ; Next page after g in the working chain / number of lines in page g.
+    sub nx(uword g) -> uword {
+        return tb_get(wbase + (g << 1))
+    }
+
+    sub setnx(uword g, uword v) {
+        tb_set(wbase + (g << 1), v)
+    }
+
+    sub nlc(uword g) -> ubyte {
+        return tb_getb(wbase + T_NL + g)
+    }
+
+    ; Choose which of the two table copies is the working one.
+    sub set_tsel(ubyte t) {
+        tsel = t
+        wbase = (t as uword) * TSET
+        sbase = ((t ^ 1) as uword) * TSET
+    }
+
+    ; Free physical pages are kept on a stack.
+    sub alloc_pg() -> uword {
+        nfree--
+        return tb_get(T_FREE + (nfree << 1))
+    }
+
+    sub free_pg(uword g) {
+        tb_set(T_FREE + (nfree << 1), g)
+        nfree++
+    }
+
+    ; The page before g in the working chain.
+    sub pred_of(uword g) -> uword {
+        uword p = head
+        while p != NIL {
+            if nx(p) == g
+                return p
+            p = nx(p)
         }
-        return lo
+        return NIL
     }
 
-    ; Rescan the whole buffer and rebuild the line-start table (after load / undo).
-    ; Stops at MAXL lines. Also invalidates the cached comment state.
-    sub rebuild_lines() {
-        uword i
-        nlines = 0
-        setls(0, 0)
-        i = 0
-        while i < blen {
-            if @(buf + i) == NL {
-                if nlines >= MAXL
-                    break
-                nlines++
-                setls(nlines, i + 1)
+    ; Replace page g by g2 in the working chain (g2 takes over g's place and line count).
+    sub relink(uword g, uword g2) {
+        uword p = pred_of(g)
+        setnx(g2, nx(g))
+        tb_setb(wbase + T_NL + g2, nlc(g))
+        if p == NIL
+            head = g2
+        else
+            setnx(p, g2)
+    }
+
+    ; --- physical pages: page g lives in bank db0 + g/4 at offset (g%4)*2048 ---
+    sub pg_read(uword g, uword dst, uword n) {
+        cx16.rambank(db0 + lsb(g >> 2))
+        sys.memcopy($a000 + ((g & 3) << 11), dst, n)
+        cx16.rambank(0)
+    }
+
+    sub pg_write(uword g, uword src, uword n) {
+        if n == 0
+            return
+        cx16.rambank(db0 + lsb(g >> 2))
+        sys.memcopy(src, $a000 + ((g & 3) << 11), n)
+        cx16.rambank(0)
+    }
+
+    ; --- the two resident slots ---
+    ; Line-start offset of line index i within slot k (entry nl is the end marker).
+    sub lso(uword i) -> uword {
+        return peekw(pls + (i << 1))
+    }
+
+    ; Rebuild slot k's line-start table from its bytes (nl lines); also sets s_bl.
+    sub slot_scan(uword nl) {
+        uword b = pbuf
+        uword t = pls
+        uword i = 0
+        uword j = 0
+        pokew(t, 0)
+        while j < nl {
+            if @(b + i) == NL {
+                j++
+                pokew(t + (j << 1), i + 1)
             }
             i++
         }
+        c_bl = i
+    }
+
+    ; Write slot k back to its physical page if it was changed.
+    sub slot_flush() {
+        if c_dirty == 0
+            return
+        pg_write(c_pg, pbuf, c_bl)
+        c_dirty = 0
+    }
+
+    sub flush_all() {
+        slot_flush()
+    }
+
+    ; Forget what is cached (after flushing).
+    sub slots_drop() {
+        flush_all()
+        c_nl = 0
+        c_pg = NIL
+    }
+
+    ; Load page g (whose first line is number fl) into slot k.
+    sub slot_load(uword g, uword fl) {
+        uword nl
+        slot_flush()
+        nl = nlc(g)
+        pg_read(g, pbuf, PG)
+        c_pg = g
+        c_fl = fl
+        c_nl = nl
+        slot_scan(nl)
+    }
+
+    ; Make the page holding line l resident (the single window). Result: f_li = line index in it.
+    sub fetch(uword l) {
+        uword g
+        uword fl
+        uword n
+        if l - c_fl < c_nl {
+            f_li = l - c_fl
+            return
+        }
+        ; walk the chain, starting from the resident page if it is not after l
+        g = head
+        fl = 0
+        if c_nl != 0 and c_fl <= l {
+            g = c_pg
+            fl = c_fl
+        }
+        repeat {
+            n = nlc(g)
+            if l - fl < n or nx(g) == NIL
+                break
+            fl += n
+            g = nx(g)
+        }
+        slot_load(g, fl)
+        f_li = l - fl
+    }
+
+    ; Pointer to the text of line l.
+    sub lp(uword l) -> uword {
+        fetch(l)
+        return pbuf + lso(f_li)
+    }
+
+    ; Number of characters in line l (not counting its newline).
+    sub linelen(uword l) -> uword {
+        fetch(l)
+        return lso(f_li + 1) - lso(f_li) - 1
+    }
+
+    ; Set up the page pool: all physical pages free, no document.
+    sub pool_reset() {
+        uword i
+        ndocpg = (nbanks - db0) * 4
+        if ndocpg > PMAX
+            ndocpg = PMAX
+        cx16.rambank(TBANK)
+        sys.memset($a000 + T_FLAGS, PMAX, 0)
+        i = 0
+        while i < ndocpg {
+            pokew($a000 + T_FREE + (i << 1), ndocpg - 1 - i)
+            i++
+        }
+        cx16.rambank(0)
+        nfree = ndocpg
+        head = NIL
+        nlines = 0
+        uvalid = false
+        set_tsel(0)
+        slots_drop()
+        c_dirty = 0
         cstate_valid = 0
     }
 
-    ; Reset to an empty document (a single newline) and home the cursor.
+    ; Reset to an empty document (a single newline).
     sub new_buffer() {
-        @(buf) = NL
-        blen = 1
-        rebuild_lines()
+        uword g
+        pool_reset()
+        @(pbuf) = NL
+        g = alloc_pg()
+        pg_write(g, pbuf, 1)
+        setnx(g, NIL)
+        tb_setb(wbase + T_NL + g, 1)
+        head = g
+        nlines = 1
         cy = 0
         cx = 0
         want = 0
         top = 0
         leftcol = 0
         modified = false
-        uvalid = false
     }
 
-    ; Insert n bytes from src at buffer offset pos. Shifts the tail up, patches the
-    ; line-start table (adding entries for any newlines inserted) and returns false
-    ; (with a message) if the buffer or the line table would overflow.
-    sub buf_insert(uword pos, uword src, uword n) -> bool {
-        uword L
-        uword k = 0
-        uword i
-        uword j
-        if blen + n > BUFSZ {
-            setmsg(iso:"Buffer full!")
-            return false
+    ; Before changing the page in slot k: if it is shared with the undo snapshot, move the working
+    ; chain to a private copy (the slot's content is flushed into it later); then mark it changed.
+    sub mod_begin() {
+        uword g = c_pg
+        uword g2
+        if tb_getb(T_FLAGS + g) != 0 {
+            g2 = alloc_pg()
+            tb_setb(T_FLAGS + g, 0)
+            relink(g, g2)
+            c_pg = g2
         }
-        i = 0
-        while i < n {
-            if @(src + i) == NL
-                k++
-            i++
-        }
-        if nlines + k > MAXL {
-            setmsg(iso:"Too many lines!")
-            return false
-        }
-        L = find_line(pos)
-        cx16.memory_copy(buf + pos, buf + pos + n, blen - pos)
-        sys.memcopy(src, buf + pos, n)
-        blen += n
-        if k != 0 {
-            cx16.memory_copy(lstart + ((L + 1) << 1), lstart + ((L + 1 + k) << 1), (nlines - L) << 1)
-            j = L + 1
-            i = 0
-            while i < n {
-                if @(src + i) == NL {
-                    setls(j, pos + i + 1)
-                    j++
-                }
-                i++
-            }
-            i = L + 1 + k
-            while i <= nlines + k {
-                setls(i, ls(i) + n)
-                i++
-            }
-            nlines += k
+        c_dirty = 1
+    }
+
+    ; Split the page in slot k (already mod_begin'ed) at line index m. The slot keeps the part that
+    ; holds the line being edited (f_li): the upper part if keep_upper, else the lower part; the
+    ; other part goes to its own physical page. f_li is updated.
+    sub page_split(uword m, bool keep_upper) {
+        uword g = c_pg
+        uword nl = c_nl
+        uword cut = lso(m)
+        uword tail = c_bl - cut
+        uword g2 = alloc_pg()
+        setnx(g2, nx(g))
+        setnx(g, g2)
+        tb_setb(wbase + T_NL + g, lsb(m))
+        tb_setb(wbase + T_NL + g2, lsb(nl - m))
+        if keep_upper {
+            pg_write(g, pbuf, cut)            ; the lower part stays in page g
+            cx16.memory_copy(pbuf + cut, pbuf, tail)
+            c_pg = g2
+            c_fl += m
+            c_nl = nl - m
+            slot_scan(nl - m)
+            f_li -= m
         } else {
-            i = L + 1
-            while i <= nlines {
-                setls(i, ls(i) + n)
-                i++
-            }
+            pg_write(g2, pbuf + cut, tail)
+            c_nl = m
+            c_bl = cut
         }
-        if L < cstate_valid
-            cstate_valid = L
-        modified = true
-        redraw_all = true
+        c_dirty = 1
+    }
+
+    ; Make room in slot k's page for `bytes` more bytes and `lines` more lines, splitting the page
+    ; if needed. The line being edited is f_li in slot k.
+    sub ensure_room(uword bytes, uword lines) -> bool {
+        ubyte tries = 0
+        uword m
+        uword half
+        while c_bl + bytes > PG or c_nl + lines > LPP {
+            if c_nl < 2 or tries == 3 {
+                setmsg(iso:"Page full!")
+                return false
+            }
+            half = c_bl >> 1
+            m = 1
+            while m < c_nl - 1 and lso(m) < half
+                m++
+            page_split(m, f_li >= m)
+            tries++
+        }
         return true
     }
 
-    ; Delete n bytes at pos. The buffer's final newline is never removed. Shifts the
-    ; tail down and patches the line-start table.
-    sub buf_delete(uword pos, uword n) {
-        uword L
-        uword k = 0
+    ; An edit at line l invalidates the cached syntax state of the lines below it.
+    sub fc_inv(uword l) {
+        if l < cstate_valid
+            cstate_valid = l
+    }
+
+    ; Can we afford an edit? Every edit may need a couple of fresh pages (copy-on-write, split).
+    sub edit_ok() -> bool {
+        if nfree < 4 {
+            setmsg(iso:"Document full!")
+            return false
+        }
+        return true
+    }
+
+    ; THE editing primitive: in line l, replace ndel bytes starting at column c by the nins bytes at
+    ; src (either may be 0; src may contain newlines; deleted bytes must lie in this page, i.e. they
+    ; may include the newline that ends the line only if it is not the last line of its page).
+    sub splice(uword l, uword c, uword ndel, uword src, uword nins) -> bool {
+        uword g
+        uword pos
         uword i
-        if pos + n >= blen {                  ; never remove the final newline
-            if pos >= blen - 1
-                return
-            n = blen - 1 - pos
+        uword add_nl = 0
+        uword del_nl = 0
+        uword newnl
+        uword need
+        if not edit_ok()
+            return false
+        i = 0
+        while i < nins {
+            if @(src + i) == NL
+                add_nl++
+            i++
         }
-        if n == 0
-            return
-        L = find_line(pos)
+        fetch(l)
+        if ndel == 0 and add_nl == 0 and nins != 0 and lso(f_li + 1) - lso(f_li) - 1 + nins > MAXLN {
+            setmsg(iso:"Line too long!")
+            return false
+        }
+        if add_nl != 0 and nlines + add_nl > MAXLINES {
+            setmsg(iso:"Too many lines!")
+            return false
+        }
+        mod_begin()
+        if nins > ndel
+            need = nins - ndel
+        else
+            need = 0
+        if need != 0 or add_nl != 0 {
+            if not ensure_room(need, add_nl)
+                return false
+        }
+        pos = lso(f_li) + c
         i = pos
-        while i < pos + n {
-            if @(buf + i) == NL
-                k++
+        while i < pos + ndel {
+            if @(pbuf + i) == NL
+                del_nl++
             i++
         }
-        cx16.memory_copy(buf + pos + n, buf + pos, blen - pos - n)
-        blen -= n
-        if k != 0 {
-            cx16.memory_copy(lstart + ((L + 1 + k) << 1), lstart + ((L + 1) << 1), (nlines - L - k + 1) << 1)
-            nlines -= k
+        i = c_bl - pos - ndel                      ; bytes after the replaced range
+        if i != 0
+            cx16.memory_copy(pbuf + pos + ndel, pbuf + pos + nins, i)
+        if nins != 0
+            sys.memcopy(src, pbuf + pos, nins)
+        g = c_pg
+        newnl = c_nl + add_nl - del_nl
+        if newnl == 0 {                               ; the page became empty: drop it
+            relink_out(g)
+            free_pg(g)
+            c_nl = 0
+            c_pg = NIL
+            c_dirty = 0
+        } else {
+            c_nl = newnl
+            tb_setb(wbase + T_NL + g, lsb(newnl))
+            if add_nl == 0 and del_nl == 0 {          ; same lines: just shift the later line starts
+                c_bl += nins - ndel
+                i = f_li + 1
+                while i <= newnl {
+                    pokew(pls + (i << 1), lso(i) + nins - ndel)
+                    i++
+                }
+            } else
+                slot_scan(newnl)
         }
-        i = L + 1
-        while i <= nlines {
-            setls(i, ls(i) - n)
-            i++
+        if add_nl != del_nl {
+            nlines += add_nl - del_nl
         }
-        if L < cstate_valid
-            cstate_valid = L
         modified = true
         redraw_all = true
+        fc_inv(l)
+        return true
+    }
+
+    ; Take page g out of the working chain.
+    sub relink_out(uword g) {
+        uword p = pred_of(g)
+        if p == NIL
+            head = nx(g)
+        else
+            setnx(p, nx(g))
+    }
+
+    ; Insert n bytes (which may contain newlines) at line l, column c.
+    sub ed_insert(uword l, uword c, uword src, uword n) -> bool {
+        return splice(l, c, 0, src, n)
+    }
+
+    ; Delete n bytes from line l starting at column c (all inside the line).
+    sub del_chars(uword l, uword c, uword n) {
+        void splice(l, c, n, 0, 0)
+    }
+
+    ; Delete the whole of line l including its newline (never the last remaining line).
+    sub del_line(uword l) {
+        if nlines > 1
+            void splice(l, 0, linelen(l) + 1, 0, 0)
+    }
+
+    ; Join line l and line l+1 (delete the newline that ends line l). Returns false if the result
+    ; would be too long.
+    sub join_next(uword l) -> bool {
+        uword n1
+        uword n2
+        if l + 1 >= nlines
+            return false
+        n1 = linelen(l)
+        n2 = linelen(l + 1)
+        if n1 + n2 > MAXLN {
+            setmsg(iso:"Line too long!")
+            return false
+        }
+        fetch(l)
+        if f_li + 1 < c_nl
+            return splice(l, n1, 1, 0, 0)
+        ; l is the last line of its page: put its text in front of line l+1 (next page), then delete
+        ; line l. Only one page is resident at a time, so the text travels through jbuf.
+        sys.memcopy(pbuf + lso(f_li), jbuf, n1)
+        if not splice(l + 1, 0, 0, jbuf, n1)
+            return false
+        del_line(l)
+        return true
     }
 
     ; ---------------------------------------------------------------
-    ; undo snapshots in banked RAM (banks 1-4 and 5-8)
+    ; undo (copy-on-write page tables, see the note at the top of this section)
     ; ---------------------------------------------------------------
-    ; Undo storage. A snapshot is the raw buffer copied into banked RAM at $A000,
-    ; 8 KB per bank: snapshot set 0 uses banks 1-4, set 1 uses banks 5-8.
-    ; bank_save copies the current buffer into set `set`.
-    sub bank_save(ubyte set) {
-        uword off = 0
-        uword n
-        ubyte b = 1 + set * 4
-        while off < blen {
-            n = blen - off
-            if n > $2000
-                n = $2000
-            cx16.rambank(b)
-            b++
-            sys.memcopy(buf + off, $a000, n)
-            off += n
-        }
-        cx16.rambank(0)
-    }
-
-    ; Copy a saved snapshot (n_total bytes) from banked RAM back into the buffer.
-    sub bank_load(ubyte set, uword n_total) {
-        uword off = 0
-        uword n
-        ubyte b = 1 + set * 4
-        while off < n_total {
-            n = n_total - off
-            if n > $2000
-                n = $2000
-            cx16.rambank(b)
-            b++
-            sys.memcopy($a000, buf + off, n)
-            off += n
-        }
-        cx16.rambank(0)
-    }
-
-    ; Take an undo snapshot of the current state; call this BEFORE every change.
+    ; Take an undo snapshot of the current state; called before each change. Pages that only the
+    ; previous snapshot still used are freed; every page of the new snapshot is marked shared.
     sub snap() {
-        bank_save(usel)
-        smeta_len[usel] = blen
-        smeta_cx[usel] = cx
-        smeta_cy[usel] = cy
+        uword g
+        flush_all()
+        cx16.rambank(TBANK)
+        if uvalid {
+            g = snap_head
+            while g != NIL {
+                if @($a000 + T_FLAGS + g) == 0 {
+                    pokew($a000 + T_FREE + (nfree << 1), g)
+                    nfree++
+                }
+                g = peekw($a000 + sbase + (g << 1))
+            }
+        }
+        cx16.memory_copy($a000 + wbase, $a000 + sbase, TSET)
+        g = head
+        while g != NIL {
+            @($a000 + T_FLAGS + g) = 1
+            g = peekw($a000 + wbase + (g << 1))
+        }
+        cx16.rambank(0)
+        snap_head = head
+        snap_nlines = nlines
+        sm_cx = cx
+        sm_cy = cy
         uvalid = true
     }
 
-    ; `u`: swap the current buffer with the saved snapshot. Because the current state is
-    ; saved into the other slot first, pressing `u` twice returns to where you were (redo).
+    ; Ctrl-Z: swap the working tables with the snapshot. The state we leave becomes the snapshot,
+    ; so pressing Ctrl-Z again redoes.
     sub do_undo() {
-        ubyte other = 1 - usel
+        uword t
         if not uvalid {
             setmsg(iso:"Nothing to undo")
             return
         }
-        bank_save(other)
-        smeta_len[other] = blen
-        smeta_cx[other] = cx
-        smeta_cy[other] = cy
-        blen = smeta_len[usel]
-        bank_load(usel, blen)
-        cx = smeta_cx[usel]
-        cy = smeta_cy[usel]
-        usel = other
-        rebuild_lines()
+        slots_drop()
+        set_tsel(tsel ^ 1)
+        t = head
+        head = snap_head
+        snap_head = t
+        t = nlines
+        nlines = snap_nlines
+        snap_nlines = t
+        t = cx
+        cx = sm_cx
+        sm_cx = t
+        t = cy
+        cy = sm_cy
+        sm_cy = t
         if cy >= nlines
             cy = nlines - 1
+        if cx > linelen(cy)
+            cx = linelen(cy)
+        cstate_valid = 0
         modified = true
         redraw_all = true
+        setmsg(iso:"Undo (Ctrl-Z again = redo)")
     }
 
     ; ---------------------------------------------------------------
@@ -1046,37 +1365,129 @@ main {
         return st
     }
 
+    ; Syntax state bits live in bank 2, one bit per line: "line l starts inside /* */ (or %asm {{)".
+    sub cs_get(uword l) -> ubyte {
+        ubyte v
+        cx16.rambank(CSBANK)
+        v = (@($a000 + (l >> 3)) >> (lsb(l) & 7)) & 1
+        cx16.rambank(0)
+        return v
+    }
+
+    sub cs_put(uword l, ubyte st) {
+        ubyte m = 1 << (lsb(l) & 7)
+        cx16.rambank(CSBANK)
+        if st & ST_BLOCK != 0
+            @($a000 + (l >> 3)) |= m
+        else
+            @($a000 + (l >> 3)) &= (m ^ $ff)
+        cx16.rambank(0)
+    }
+
+    ; Skip a string/char literal starting at s[i] (the quote); returns the index after it.
+    sub skip_lit(uword s, ubyte n, ubyte i) -> ubyte {
+        ubyte c = @(s + i)
+        i++
+        while i < n and @(s + i) != c {
+            if @(s + i) == iso:'\\'
+                i++
+            i++
+        }
+        if i < n
+            i++
+        return i
+    }
+
+    ; Fast version of what hl_c / hl_p8 return: only follows the multi-line state, no colouring.
+    ; (Scanning a whole file with the real highlighters would take far too long.)
+    sub fast_state(uword s, ubyte n, ubyte st) -> ubyte {
+        ubyte i = 0
+        ubyte c
+        ubyte j
+        ubyte k
+        if lang == L_C {
+            while i < n {
+                c = @(s + i)
+                if st & ST_BLOCK != 0 {
+                    if c == iso:'*' and i + 1 < n and @(s + i + 1) == iso:'/' {
+                        st = 0
+                        i++
+                    }
+                    i++
+                } else if c == iso:'/' and i + 1 < n and @(s + i + 1) == iso:'/' {
+                    return st
+                } else if c == iso:'/' and i + 1 < n and @(s + i + 1) == iso:'*' {
+                    st = ST_BLOCK
+                    i += 2
+                } else if c == iso:'"' or c == iso:'\'' {
+                    i = skip_lit(s, n, i)
+                } else
+                    i++
+            }
+            return st
+        }
+        ; Prog8
+        if st & ST_BLOCK != 0 {
+            while i < n {
+                if @(s + i) == iso:'}' and i + 1 < n and @(s + i + 1) == iso:'}'
+                    return 0
+                i++
+            }
+            return st
+        }
+        while i < n {
+            c = @(s + i)
+            if c == iso:';'
+                return st
+            if c == iso:'"' or c == iso:'\'' {
+                i = skip_lit(s, n, i)
+                continue
+            }
+            if c == iso:'%' and i + 4 <= n and @(s + i + 1) == iso:'a' and @(s + i + 2) == iso:'s' and @(s + i + 3) == iso:'m' and (i + 4 == n or not is_idchar(@(s + i + 4))) {
+                j = i + 4
+                while j < n and not (@(s + j) == iso:'{' and j + 1 < n and @(s + j + 1) == iso:'{')
+                    j++
+                if j < n {
+                    j += 2
+                    k = j
+                    while k < n and not (@(s + k) == iso:'}' and k + 1 < n and @(s + k + 1) == iso:'}')
+                        k++
+                    if k >= n
+                        return ST_BLOCK
+                    i = k + 2
+                    continue
+                }
+                i += 4
+                continue
+            }
+            i++
+        }
+        return st
+    }
+
     ; State (see hl_c) at the START of line l. C/Prog8 need it for multi-line constructs.
-    ; cstate holds one cached bit per line; we extend the cache by highlighting forward
-    ; from cstate_valid, so an edit only invalidates the lines below it.
+    ; We extend the cached bits by scanning forward from cstate_valid, so an edit only
+    ; invalidates the lines below it.
     sub line_state(uword l) -> ubyte {
         ubyte st
-        ubyte bit
-        uword ix
+        uword n
         if lang != L_C and lang != L_P8
             return 0
         while cstate_valid < l {
             if cstate_valid == 0
                 st = 0
-            else {
-                ix = cstate_valid >> 3
-                bit = lsb(cstate_valid) & 7
-                st = (@(cstate + ix) >> bit) & 1
-            }
-            st = highlight(buf + ls(cstate_valid), linelen(cstate_valid), st)
-            cstate_valid++
-            ix = cstate_valid >> 3
-            bit = lsb(cstate_valid) & 7
-            if st & ST_BLOCK != 0
-                @(cstate + ix) |= (1 << bit)
             else
-                @(cstate + ix) &= ((1 << bit) ^ $ff)
+                st = cs_get(cstate_valid)
+            n = linelen(cstate_valid)
+            if n > 255
+                n = 255
+            st = fast_state(lp(cstate_valid), lsb(n), st)
+            cstate_valid++
+            cs_put(cstate_valid, st)
         }
         if l == 0
             return 0
-        ix = l >> 3
-        bit = lsb(l) & 7
-        return (@(cstate + ix) >> bit) & 1
+        return cs_get(l)
     }
 
     ; extension table: name, NUL, language byte ...
@@ -1151,7 +1562,7 @@ main {
     ; ---------------------------------------------------------------
     ; Screen column of character index `upto` in line l, expanding tabs to the tab width.
     sub visual_col(uword l, uword upto) -> uword {
-        uword s = buf + ls(l)
+        uword s = lp(l)
         uword i = 0
         uword v = 0
         while i < upto {
@@ -1218,9 +1629,9 @@ main {
             }
             return
         }
-        s = buf + ls(l)
+        st = line_state(l)               ; (before lp: it walks other lines)
+        s = lp(l)
         n = linelen(l)
-        st = line_state(l)
         void highlight(s, n, st)
         x = 0
         if g != 0 {
@@ -1498,7 +1909,7 @@ main {
         uword i = 0
         uword v = 0
         uword w
-        uword s = buf + ls(cy)
+        uword s = lp(cy)
         while i < n {
             if @(s + i) == TAB
                 w = tabw - (v % tabw)
@@ -1521,7 +1932,7 @@ main {
             l = nlines - 1
         cy = l
         cx = 0
-        s = buf + ls(cy)
+        s = lp(cy)
         n = linelen(cy)
         while cx < n and (@(s + cx) == SP or @(s + cx) == TAB)
             cx++
@@ -1552,135 +1963,249 @@ main {
         return is_idchar(c)
     }
 
-    ; Buffer offset of the cursor.
-    sub cur_pos() -> uword {
-        return ls(cy) + cx
+    ; Scan position for the character-stream helpers below (the text is seen as one stream of
+    ; characters in which the end of each line reads as a newline).
+    uword pl
+    uword pc
+
+    ; Are we on the final newline of the document / at its very start?
+    sub at_end() -> bool {
+        return pl + 1 >= nlines and pc >= linelen(pl)
     }
 
-    ; Place the cursor at buffer offset pos.
-    sub set_pos(uword pos) {
-        cy = find_line(pos)
-        cx = pos - ls(cy)
+    sub at_start() -> bool {
+        return pl == 0 and pc == 0
+    }
+
+    ; Character at the scan position (NL at the end of a line).
+    sub pch() -> ubyte {
+        if pc >= linelen(pl)
+            return NL
+        return @(lp(pl) + pc)
+    }
+
+    ; Character just before the scan position (NL at the start of a line).
+    sub pprev_ch() -> ubyte {
+        if pc == 0
+            return NL
+        return @(lp(pl) + pc - 1)
+    }
+
+    ; Step the scan position forward / back one character (stays put at the ends).
+    sub pnext() {
+        if pc < linelen(pl)
+            pc++
+        else if pl + 1 < nlines {
+            pl++
+            pc = 0
+        }
+    }
+
+    sub pprev() {
+        if pc > 0
+            pc--
+        else if pl > 0 {
+            pl--
+            pc = linelen(pl)
+        }
+    }
+
+    ; Place the cursor at line l, column c.
+    sub set_pos(uword l, uword c) {
+        cy = l
+        cx = c
         clamp_cx()
         set_want()
     }
 
-    ; Offset of the start of the next word after p (vi's `w`).
-    sub word_fwd(uword p) -> uword {
+    ; Move the scan position to the start of the next word (vi's `w`).
+    sub word_fwd() {
         ubyte c
-        if p >= blen - 1
-            return blen - 1
-        c = @(buf + p)
+        if at_end()
+            return
+        c = pch()
         if is_word(c) {
-            while p < blen - 1 and is_word(@(buf + p))
-                p++
+            while not at_end() and is_word(pch())
+                pnext()
         } else if c != SP and c != TAB and c != NL {
-            while p < blen - 1 and not is_word(@(buf + p)) and @(buf + p) != SP and @(buf + p) != TAB and @(buf + p) != NL
-                p++
+            while not at_end() and not is_word(pch()) and pch() != SP and pch() != TAB and pch() != NL
+                pnext()
         }
-        while p < blen - 1 and (@(buf + p) == SP or @(buf + p) == TAB)
-            p++
-        if p < blen - 1 and @(buf + p) == NL {
-            p++                      ; move onto next line start
-            while p < blen - 1 and (@(buf + p) == SP or @(buf + p) == TAB)
-                p++
+        while not at_end() and (pch() == SP or pch() == TAB)
+            pnext()
+        if not at_end() and pch() == NL {
+            pnext()                  ; move onto next line start
+            while not at_end() and (pch() == SP or pch() == TAB)
+                pnext()
         }
-        return p
     }
 
-    ; Offset of the start of the word before p (vi's `b`).
-    sub word_back(uword p) -> uword {
-        if p == 0
-            return 0
-        p--
-        while p > 0 and (@(buf + p) == SP or @(buf + p) == TAB or @(buf + p) == NL)
-            p--
-        if is_word(@(buf + p)) {
-            while p > 0 and is_word(@(buf + p - 1))
-                p--
+    ; Move the scan position to the start of the word before it (vi's `b`).
+    sub word_back() {
+        if at_start()
+            return
+        pprev()
+        while not at_start() and (pch() == SP or pch() == TAB or pch() == NL)
+            pprev()
+        if is_word(pch()) {
+            while not at_start() and is_word(pprev_ch())
+                pprev()
         } else {
-            while p > 0 and not is_word(@(buf + p - 1)) and @(buf + p - 1) != SP and @(buf + p - 1) != TAB and @(buf + p - 1) != NL
-                p--
+            while not at_start() and not is_word(pprev_ch()) and pprev_ch() != SP and pprev_ch() != TAB and pprev_ch() != NL
+                pprev()
         }
-        return p
     }
 
-    ; ---------------------------------------------------------------
-    ; register (yank) handling
-    ; ---------------------------------------------------------------
-    ; Copy buffer[a..b) into the register (the paste buffer). linewise = whole lines.
-    sub yank_range(uword a, uword b, bool linewise) {
-        uword n = b - a
-        if n > REGSZ {
-            n = REGSZ
-            setmsg(iso:"Yank truncated")
+    ; A range of text is ra..rb (line, column; rb excluded). Linewise ranges run from column 0 of
+    ; one line to column 0 of a later line, so they include the final newline.
+    uword ra_l
+    uword ra_c
+    uword rb_l
+    uword rb_c
+
+    ; Copy the range into the register (the paste buffer). linewise = whole lines.
+    sub yank_range(bool linewise) {
+        uword l = ra_l
+        uword c = ra_c
+        uword n = 0
+        uword e
+        uword s
+        bool trunc = false
+        while l < rb_l or (l == rb_l and c < rb_c) {
+            e = linelen(l)
+            s = lp(l)
+            if l == rb_l and rb_c < e
+                e = rb_c
+            while c < e {
+                if n < REGSZ {
+                    @(reg + n) = @(s + c)
+                    n++
+                } else
+                    trunc = true
+                c++
+            }
+            if l < rb_l {
+                if n < REGSZ {
+                    @(reg + n) = NL
+                    n++
+                } else
+                    trunc = true
+                l++
+                c = 0
+            } else
+                break
         }
-        sys.memcopy(buf + a, reg, n)
+        if trunc
+            setmsg(iso:"Yank truncated")
         reglen = n
         reglines = linewise
     }
 
-    ; Yank buffer[a..b) into the register, then delete it (vi's `d`).
-    sub delete_range(uword a, uword b, bool linewise) {
-        yank_range(a, b, linewise)
-        buf_delete(a, b - a)
+    ; Yank the range into the register, then delete it (vi's `d`).
+    sub delete_range(bool linewise) {
+        uword l
+        yank_range(linewise)
+        if linewise {
+            l = ra_l
+            while l < rb_l {
+                if nlines > 1
+                    del_line(ra_l)
+                else
+                    del_chars(ra_l, 0, linelen(ra_l))
+                l++
+            }
+            return
+        }
+        if ra_l == rb_l {
+            del_chars(ra_l, ra_c, rb_c - ra_c)
+            return
+        }
+        del_chars(rb_l, 0, rb_c)                  ; head of the last line
+        l = rb_l
+        while l > ra_l + 1 {                      ; whole lines in between
+            l--
+            del_line(l)
+        }
+        del_chars(ra_l, ra_c, linelen(ra_l) - ra_c)   ; tail of the first line
+        void join_next(ra_l)
     }
 
-    uword lr_a
-    uword lr_b
-
-    ; For cnt lines starting at l, set lr_a/lr_b to the buffer range they cover.
+    ; Set the range to cnt whole lines starting at line l (linewise).
     sub line_range(uword l, uword cnt) {
-        uword last = l + cnt
-        if last > nlines
-            last = nlines
-        lr_a = ls(l)
-        lr_b = ls(last)
+        ra_l = l
+        ra_c = 0
+        rb_l = l + cnt
+        if rb_l > nlines
+            rb_l = nlines
+        rb_c = 0
     }
 
-    ; ---------------------------------------------------------------
-    ; search
-    ; ---------------------------------------------------------------
     ; Search for `lastsearch` (a plain string, no regex) from the cursor, wrapping around the
     ; file. dir = +1 forward, -1 backward. Moves the cursor and returns true if found.
     sub do_search(byte dir, bool from_next) -> bool {
         uword plen = slen(&lastsearch)
-        uword p
-        uword start
+        uword l
+        uword n
+        uword s
         uword i
+        uword lo
+        uword hi
+        uword cnt = 0
         if plen == 0 {
             setmsg(iso:"No previous search")
             return false
         }
-        start = cur_pos()
+        l = cy
         if dir > 0 {
-            p = start
+            lo = cx
             if from_next
-                p++
-            i = 0
-            while i < blen {
-                if p >= blen
-                    p -= blen
-                if p + plen <= blen and @(buf + p) == lastsearch[0] and memeq(buf + p, &lastsearch, plen) {
-                    set_pos(p)
-                    return true
+                lo++
+            while cnt <= nlines {
+                n = linelen(l)
+                s = lp(l)
+                hi = n
+                if cnt == nlines {
+                    hi = cx + plen
+                    if hi > n
+                        hi = n
                 }
-                i++
-                p++
+                i = lo
+                while i + plen <= hi {
+                    if @(s + i) == lastsearch[0] and memeq(s + i, &lastsearch, plen) {
+                        set_pos(l, i)
+                        return true
+                    }
+                    i++
+                }
+                l++
+                if l >= nlines
+                    l = 0
+                lo = 0
+                cnt++
             }
         } else {
-            p = start
-            i = 0
-            while i < blen {
-                if p != 0
-                    p--
-                else
-                    p = blen - 1
-                if p + plen <= blen and @(buf + p) == lastsearch[0] and memeq(buf + p, &lastsearch, plen) {
-                    set_pos(p)
-                    return true
+            while cnt <= nlines {
+                n = linelen(l)
+                s = lp(l)
+                lo = 0
+                hi = n + 1
+                if cnt == 0
+                    hi = cx
+                else if cnt == nlines
+                    lo = cx
+                i = hi
+                while i > lo {
+                    i--
+                    if i + plen <= n and @(s + i) == lastsearch[0] and memeq(s + i, &lastsearch, plen) {
+                        set_pos(l, i)
+                        return true
+                    }
                 }
-                i++
+                if l == 0
+                    l = nlines - 1
+                else
+                    l--
+                cnt++
             }
         }
         setmsg(iso:"Pattern not found")
@@ -1689,12 +2214,13 @@ main {
 
     ; `%`: jump to the bracket matching the one under the cursor, counting nesting.
     sub match_bracket() {
-        uword p = cur_pos()
-        uword q
-        ubyte c = @(buf + p)
+        ubyte c
         ubyte t
         byte d
         uword depth = 0
+        pl = cy
+        pc = cx
+        c = pch()
         when c {
             iso:'(' -> {
                 t = iso:')'
@@ -1722,22 +2248,21 @@ main {
             }
             else -> return
         }
-        q = p
         repeat {
             if d > 0 {
-                q++
-                if q >= blen
+                if at_end()
                     return
+                pnext()
             } else {
-                if q == 0
+                if at_start()
                     return
-                q--
+                pprev()
             }
-            if @(buf + q) == c
+            if pch() == c
                 depth++
-            else if @(buf + q) == t {
+            else if pch() == t {
                 if depth == 0 {
-                    set_pos(q)
+                    set_pos(pl, pc)
                     return
                 }
                 depth--
@@ -1793,15 +2318,60 @@ main {
         cbm.CLOSE(15)
     }
 
-    ; Load a file into the buffer (device 8). Converts CR / CRLF to LF, drops NULs, makes
-    ; sure the text ends in a newline and sets `truncated` if it did not fit.
-    ; Returns false (and a message) if the file could not be read.
+    uword ld_o                ; bytes waiting in the page accumulator (pbuf)
+    uword ld_lc               ; complete lines among them
+    uword ld_cl               ; length of the line being read
+    uword ld_tail             ; last page stored so far
+
+    ; Store the first nb bytes (nlns complete lines) of the accumulator as a new page; whatever
+    ; follows (a partly read line) moves to the front.
+    sub ld_commit(uword nb, uword nlns) {
+        uword g
+        if nfree <= 8 {
+            truncated = true
+            return
+        }
+        g = alloc_pg()
+        pg_write(g, pbuf, nb)
+        setnx(g, NIL)
+        tb_setb(wbase + T_NL + g, lsb(nlns))
+        if head == NIL
+            head = g
+        else
+            setnx(ld_tail, g)
+        ld_tail = g
+        nlines += nlns
+        if ld_o > nb
+            cx16.memory_copy(pbuf + nb, pbuf, ld_o - nb)
+        ld_o -= nb
+        ld_lc -= nlns
+    }
+
+    ; Append one byte to the accumulator, starting a new page when the current one is full.
+    sub ld_put(ubyte c) {
+        if ld_o >= FILL or ld_lc >= LPP - 2
+            ld_commit(ld_o - ld_cl, ld_lc)
+        if truncated
+            return
+        @(pbuf + ld_o) = c
+        ld_o++
+        if c == NL {
+            ld_lc++
+            ld_cl = 0
+        } else
+            ld_cl++
+    }
+
+    ; Load a file (device 8) into the paged document: CR/CRLF become LF, NULs are dropped, a final
+    ; newline is added, lines longer than MAXLN are broken, and `truncated` is set if it did not fit.
+    ; The file streams straight into pages in banked RAM. Returns false if it could not be read.
     sub load_file(uword name) -> bool {
-        uword o = 0
         ubyte c
         ubyte prev = 0
         ubyte stt
+        bool wrapped = false
 
+        pool_reset()
         copystr(&iobuf2, name, 44)
         appendstr(&iobuf2, iso:",s,r")
         dosname(&iobuf2)
@@ -1809,6 +2379,9 @@ main {
         cbm.SETLFS(2, DEVICE, 2)
         void cbm.OPEN()
         truncated = false
+        ld_o = 0
+        ld_lc = 0
+        ld_cl = 0
         void cbm.CHKIN(2)
         repeat {
             c = cbm.CHRIN()
@@ -1825,12 +2398,13 @@ main {
             }
             prev = c
             if c != 0 {
-                if o >= BUFSZ - 2 {
-                    truncated = true
-                    break
+                if c != NL and ld_cl >= MAXLN {
+                    ld_put(NL)
+                    wrapped = true
                 }
-                @(buf + o) = c
-                o++
+                ld_put(c)
+                if truncated
+                    break
             }
             if stt & $40 != 0
                 break
@@ -1839,39 +2413,56 @@ main {
         cbm.CLOSE(2)
         dos_status(&dstat, 40)
         if dstat[0] == iso:'6' or dstat[0] == iso:'7' or (dstat[0] == iso:'5' and dstat[1] != iso:'0') {
-            ; 62 = file not found, etc
-            if o == 0 {
+            if ld_o == 0 and nlines == 0 {
                 setmsg(&dstat)
                 return false
             }
         }
-        if o == 0 or @(buf + o - 1) != NL {
-            @(buf + o) = NL
-            o++
+        if not truncated {
+            if ld_o == 0 or @(pbuf + ld_o - 1) != NL
+                ld_put(NL)
         }
-        blen = o
-        rebuild_lines()
+        if ld_o > 0 and not truncated
+            ld_commit(ld_o, ld_lc)
+        if nlines == 0 {
+            @(pbuf) = NL
+            ld_o = 1
+            ld_lc = 1
+            truncated = false
+            ld_commit(1, 1)
+        }
+        if wrapped
+            setmsg(iso:"Very long lines were split")
         return true
     }
 
-    ; Write the buffer to a file, replacing it (the `@:` prefix means overwrite).
-    ; Reports the drive's status if it is not "00".
+    ; Write the document to a file, replacing it (`@:`). Reports the drive status unless it is "00".
     sub save_file(uword name) -> bool {
-        uword o = 0
-        ubyte c
+        uword p
+        uword o
+        uword n
 
         copystr(&iobuf2, iso:"@:", 4)
         appendstr(&iobuf2, name)
         appendstr(&iobuf2, iso:",s,w")
         dosname(&iobuf2)
+        flush_all()
         cbm.SETNAM(slen(&iobuf2), &iobuf2)
         cbm.SETLFS(2, DEVICE, 2)
         void cbm.OPEN()
         cbm.CHKOUT(2)
-        while o < blen {
-            cbm.CHROUT(@(buf + o))
-            o++
+        p = head
+        while p != NIL {
+            slot_load(p, 0)
+            o = 0
+            n = c_bl
+            while o < n {
+                cbm.CHROUT(@(pbuf + o))
+                o++
+            }
+            p = nx(p)
         }
+        slots_drop()                      ; slot 0 was borrowed with made-up line numbers
         cbm.CLRCHN()
         cbm.CLOSE(2)
         dos_status(&dstat, 40)
@@ -2064,12 +2655,12 @@ main {
         }
         l = l1
         while l <= l2 and not abort {
-            q = ls(l)
+            q = 0
             repeat {
-                endp = ls(l + 1) - 1
+                endp = linelen(l)
                 found = false
                 while q + plen <= endp {
-                    if @(buf + q) == spat[0] and memeq(buf + q, &spat, plen) {
+                    if @(lp(l) + q) == spat[0] and memeq(lp(l) + q, &spat, plen) {
                         found = true
                         break
                     }
@@ -2083,12 +2674,12 @@ main {
                 }
                 if rlen != 0 {
                     ; insert first so a full buffer leaves the text untouched
-                    if not buf_insert(q, &srep, rlen) {
+                    if not ed_insert(l, q, &srep, rlen) {
                         abort = true
                         break
                     }
                 }
-                buf_delete(q + rlen, plen)
+                del_chars(l, q + rlen, plen)
                 nsub++
                 lastl = l
                 q += rlen
@@ -2271,7 +2862,7 @@ main {
     ; Insert one character at the cursor and advance.
     sub insert_char(ubyte c) {
         chbuf[0] = c
-        if buf_insert(cur_pos(), &chbuf, 1)
+        if ed_insert(cy, cx, &chbuf, 1)
             cx++
     }
 
@@ -2284,7 +2875,7 @@ main {
         uword i
         ins[0] = NL
         if autoind {
-            s = buf + ls(cy)
+            s = lp(cy)
             i = 0
             while i < cx and i < 36 and (@(s + i) == SP or @(s + i) == TAB) {
                 ins[n] = @(s + i)
@@ -2292,7 +2883,7 @@ main {
                 i++
             }
         }
-        if buf_insert(cur_pos(), &ins, n) {
+        if ed_insert(cy, cx, &ins, n) {
             cy++
             cx = n - 1
         }
@@ -2302,6 +2893,7 @@ main {
     ; keys and printable characters. On exit the cursor steps back one, like vi.
     sub insert_loop() {
         ubyte k
+        uword n
         repeat {
             refresh(false)
             k = getkey()
@@ -2313,16 +2905,20 @@ main {
                 $14, $08, $7f -> {          ; backspace
                     if cx > 0 {
                         cx--
-                        buf_delete(cur_pos(), 1)
+                        del_chars(cy, cx, 1)
                     } else if cy > 0 {
-                        cx = linelen(cy - 1)
-                        cy--
-                        buf_delete(cur_pos(), 1)
+                        n = linelen(cy - 1)
+                        if join_next(cy - 1) {
+                            cy--
+                            cx = n
+                        }
                     }
                 }
                 $19 -> {                    ; delete
-                    if cx < linelen(cy) or cy + 1 < nlines
-                        buf_delete(cur_pos(), 1)
+                    if cx < linelen(cy)
+                        del_chars(cy, cx, 1)
+                    else if cy + 1 < nlines
+                        void join_next(cy)
                 }
                 $9d -> {
                     if cx != 0
@@ -2380,7 +2976,7 @@ main {
             if k < 32
                 continue
             if cx < linelen(cy)
-                buf_delete(cur_pos(), 1)
+                del_chars(cy, cx, 1)
             insert_char(k)
         }
         mode = 0
@@ -2397,14 +2993,11 @@ main {
         insert_loop()
     }
 
-    ; ---------------------------------------------------------------
-    ; normal mode
-    ; ---------------------------------------------------------------
     ; `o` / `O`: open a new (auto-indented) line below/above and enter insert mode.
     sub open_line(bool below) {
-        uword pos
+        uword lcol
         ubyte n = 0
-        uword s = buf + ls(cy)
+        uword s = lp(cy)
         uword i = 0
         uword ll = linelen(cy)
         ubyte j
@@ -2415,7 +3008,7 @@ main {
                 i++
             }
         }
-        if below {                       ; "\n" + indent, before this line's newline
+        if below {                       ; "\n" + indent, at the end of this line
             j = n
             while j != 0 {
                 ins[j] = ins[j - 1]
@@ -2423,14 +3016,14 @@ main {
             }
             ins[0] = NL
             n++
-            pos = ls(cy + 1) - 1
-        } else {
+            lcol = ll
+        } else {                         ; indent + "\n", at the start of this line
             ins[n] = NL
             n++
-            pos = ls(cy)
+            lcol = 0
         }
         snap()
-        if buf_insert(pos, &ins, n) {
+        if ed_insert(cy, lcol, &ins, n) {
             if below
                 cy++
             cx = n - 1
@@ -2442,8 +3035,11 @@ main {
     ; `p` / `P`: paste the register `count` times. Whole-line registers go on a new line
     ; below/above; character registers go after/before the cursor.
     sub paste(bool after, uword count) {
-        uword pos
+        uword lcol
         uword c
+        uword nn
+        uword tailn
+        uword i
         if reglen == 0 {
             setmsg(iso:"Nothing in register")
             return
@@ -2451,46 +3047,61 @@ main {
         snap()
         if reglines {
             if after {
-                pos = ls(cy + 1) - 1
+                lcol = linelen(cy)
                 c = 0
                 while c < count {
-                    if not buf_insert(pos, &nlbuf, 1)
+                    if not ed_insert(cy, lcol, &nlbuf, 1)
                         break
-                    if not buf_insert(pos + 1, reg, reglen - 1)
+                    if not ed_insert(cy + 1, 0, reg, reglen - 1)
                         break
                     c++
                 }
-                cy = find_line(pos + 1)
+                cy++
             } else {
-                pos = ls(cy)
                 c = 0
                 while c < count {
-                    if not buf_insert(pos, reg, reglen)
+                    if not ed_insert(cy, 0, reg, reglen)
                         break
                     c++
                 }
-                cy = find_line(pos)
             }
             goto_line(cy)
         } else {
-            pos = cur_pos()
+            lcol = cx
             if after and linelen(cy) != 0
-                pos++
+                lcol++
             c = 0
             while c < count {
-                if not buf_insert(pos, reg, reglen)
+                if not ed_insert(cy, lcol, reg, reglen)
                     break
                 c++
             }
-            set_pos(pos + reglen * count - 1)
+            ; cursor goes to the last pasted character: count newlines and the tail after the last one
+            nn = 0
+            tailn = reglen
+            i = 0
+            while i < reglen {
+                if @(reg + i) == NL {
+                    nn++
+                    tailn = reglen - 1 - i
+                }
+                i++
+            }
+            if nn == 0
+                set_pos(cy, lcol + reglen * count - 1)
+            else if tailn > 0
+                set_pos(cy + nn * count, tailn - 1)
+            else
+                set_pos(cy + nn * count - 1, 65000)
         }
     }
 
     ; `J`: join count lines, collapsing the leading blanks of each into one space.
     sub join_lines(uword count) {
         uword c
-        uword pos
+        uword e
         uword n
+        uword m
         snap()
         if count < 2
             count = 2
@@ -2498,14 +3109,18 @@ main {
         while c < count {
             if cy + 1 >= nlines
                 break
-            pos = ls(cy + 1) - 1             ; the newline
-            n = 1
-            while pos + n < blen - 1 and (@(buf + pos + n) == SP or @(buf + pos + n) == TAB)
+            e = linelen(cy)
+            m = linelen(cy + 1)
+            n = 0
+            while n < m and (@(lp(cy + 1) + n) == SP or @(lp(cy + 1) + n) == TAB)
                 n++
-            buf_delete(pos, n)
-            if linelen(cy) != 0 and pos > ls(cy) and @(buf + pos - 1) != SP and @(buf + pos) != NL
-                void buf_insert(pos, " ", 1)
-            cx = pos - ls(cy)
+            if n != 0
+                del_chars(cy + 1, 0, n)
+            if not join_next(cy)
+                break
+            if e > 0 and m > n and @(lp(cy) + e - 1) != SP
+                void ed_insert(cy, e, " ", 1)
+            cx = e
             c++
         }
         clamp_cx()
@@ -2519,12 +3134,12 @@ main {
         ubyte k
         bool mcount_set = false
         uword mcount = 0
-        uword a
-        uword b
-        uword p0 = cur_pos()
-        uword q
+        uword al
+        uword ac
+        uword bl
+        uword bc
         uword cc
-        uword eol
+        uword e
 
         repeat {
             k = getkey()
@@ -2544,122 +3159,134 @@ main {
             return
         if k == op {                              ; dd, yy, cc
             line_range(cy, count)
-            a = lr_a
-            b = lr_b
             if op == iso:'y' {
-                yank_range(a, b, true)
+                yank_range(true)
                 setmsg(iso:"yanked")
                 return
             }
             snap()
             if op == iso:'c' {
-                ; keep indentation-less empty line
-                yank_range(a, b, true)
-                buf_delete(a, b - a - 1)
+                ; keep one empty line in place of the lines
+                yank_range(true)
+                cc = ra_l + 1
+                while cc < rb_l {
+                    del_line(ra_l + 1)
+                    cc++
+                }
+                del_chars(cy, 0, linelen(cy))
                 cx = 0
                 start_insert()
                 return
             }
-            delete_range(a, b, true)
+            delete_range(true)
             if cy >= nlines
                 cy = nlines - 1
             goto_line(cy)
             return
         }
+        al = cy
+        ac = cx
+        bl = cy
+        bc = cx
         when k {
             iso:'w' -> {
-                q = p0
-                eol = ls(cy + 1) - 1
+                pl = cy
+                pc = cx
                 cc = 0
                 while cc < count {
-                    q = word_fwd(q)
+                    word_fwd()
                     cc++
                 }
                 if op == iso:'c' {                ; cw acts like ce
-                    q = p0
+                    pl = cy
+                    pc = cx
                     cc = 0
                     while cc < count {
-                        if q < blen - 1 and @(buf + q) != SP and @(buf + q) != TAB {
-                            if is_word(@(buf + q)) {
-                                while q < blen - 1 and is_word(@(buf + q))
-                                    q++
+                        if not at_end() and pch() != SP and pch() != TAB {
+                            if is_word(pch()) {
+                                while not at_end() and is_word(pch())
+                                    pnext()
                             } else
-                                q++
+                                pnext()
                         }
                         if cc + 1 < count {
-                            while q < blen - 1 and (@(buf + q) == SP or @(buf + q) == TAB)
-                                q++
+                            while not at_end() and (pch() == SP or pch() == TAB)
+                                pnext()
                         }
                         cc++
                     }
                 }
-                if q > eol and count == 1
-                    q = eol
-                a = p0
-                b = q
+                if pl > cy and count == 1 {       ; a single word stops at the end of the line
+                    pl = cy
+                    pc = linelen(cy)
+                }
+                bl = pl
+                bc = pc
             }
             iso:'$' -> {
-                a = p0
-                b = ls(cy + count) - 1
-                if cy + count > nlines
-                    b = ls(nlines) - 1
+                bl = cy + count
+                if bl > nlines
+                    bl = nlines
+                bl--
+                bc = linelen(bl)
             }
-            iso:'0' -> {
-                a = ls(cy)
-                b = p0
-            }
+            iso:'0' -> ac = 0
             iso:'^' -> {
-                q = ls(cy)
-                while @(buf + q) == SP or @(buf + q) == TAB
-                    q++
-                if q < p0 {
-                    a = q
-                    b = p0
+                e = 0
+                while e < linelen(cy) and (@(lp(cy) + e) == SP or @(lp(cy) + e) == TAB)
+                    e++
+                if e < cx {
+                    ac = e
+                    bc = cx
                 } else {
-                    a = p0
-                    b = q
+                    ac = cx
+                    bc = e
                 }
             }
             iso:'b' -> {
-                q = p0
+                pl = cy
+                pc = cx
                 cc = 0
                 while cc < count {
-                    q = word_back(q)
+                    word_back()
                     cc++
                 }
-                a = q
-                b = p0
+                al = pl
+                ac = pc
             }
             iso:'l' -> {
-                a = p0
-                b = p0 + count
-                if b > ls(cy + 1) - 1
-                    b = ls(cy + 1) - 1
+                bc = cx + count
+                if bc > linelen(cy)
+                    bc = linelen(cy)
             }
             iso:'h' -> {
-                if p0 > ls(cy) + count
-                    a = p0 - count
+                if cx > count
+                    ac = cx - count
                 else
-                    a = ls(cy)
-                b = p0
+                    ac = 0
             }
             else -> return
         }
-        if a >= b {
+        if al > bl or (al == bl and ac >= bc) {
             if op == iso:'c'
                 start_insert()
             return
         }
+        ra_l = al
+        ra_c = ac
+        rb_l = bl
+        rb_c = bc
         snap()
         if op == iso:'y' {
-            yank_range(a, b, false)
-            set_pos(a)
+            yank_range(false)
+            set_pos(al, ac)
             return
         }
-        delete_range(a, b, false)
-        set_pos(a)
+        delete_range(false)
+        set_pos(al, ac)
         if op == iso:'c' {
-            cx = a - ls(cy)
+            cy = al
+            cx = ac
             start_insert()
         }
     }
@@ -2706,22 +3333,24 @@ main {
                 want = $fff
             }
             iso:'w' -> {
-                p = cur_pos()
+                pl = cy
+                pc = cx
                 c = 0
                 while c < count {
-                    p = word_fwd(p)
+                    word_fwd()
                     c++
                 }
-                set_pos(p)
+                set_pos(pl, pc)
             }
             iso:'b' -> {
-                p = cur_pos()
+                pl = cy
+                pc = cx
                 c = 0
                 while c < count {
-                    p = word_back(p)
+                    word_back()
                     c++
                 }
-                set_pos(p)
+                set_pos(pl, pc)
             }
             iso:'G' -> {
                 if count != 0
@@ -2788,7 +3417,7 @@ main {
                 snap()
                 goto_line(cy)
                 cx = 0
-                s = buf + ls(cy)
+                s = lp(cy)
                 while cx < linelen(cy) and (@(s + cx) == SP or @(s + cx) == TAB)
                     cx++
                 start_insert()
@@ -2813,7 +3442,11 @@ main {
                     if n > count
                         n = count
                     snap()
-                    delete_range(cur_pos(), cur_pos() + n, false)
+                    ra_l = cy
+                    ra_c = cx
+                    rb_l = cy
+                    rb_c = cx + n
+                    delete_range(false)
                     clamp_cx()
                     set_want()
                 }
@@ -2825,16 +3458,24 @@ main {
                     n = cx
                 if n != 0 {
                     snap()
-                    delete_range(cur_pos() - n, cur_pos(), false)
+                    ra_l = cy
+                    ra_c = cx - n
+                    rb_l = cy
+                    rb_c = cx
+                    delete_range(false)
                     cx -= n
                     set_want()
                 }
             }
             iso:'D', iso:'C' -> {
                 snap()
-                p = ls(cy + 1) - 1
-                if p > cur_pos()
-                    delete_range(cur_pos(), p, false)
+                if linelen(cy) > cx {
+                    ra_l = cy
+                    ra_c = cx
+                    rb_l = cy
+                    rb_c = linelen(cy)
+                    delete_range(false)
+                }
                 if k == iso:'C' {
                     cx = linelen(cy)
                     start_insert()
@@ -2848,8 +3489,13 @@ main {
                 n = linelen(cy) - cx
                 if n > count
                     n = count
-                if n != 0
-                    delete_range(cur_pos(), cur_pos() + n, false)
+                if n != 0 {
+                    ra_l = cy
+                    ra_c = cx
+                    rb_l = cy
+                    rb_c = cx + n
+                    delete_range(false)
+                }
                 start_insert()
             }
             iso:'r' -> {
@@ -2858,9 +3504,9 @@ main {
                     snap()
                     c = 0
                     while c < count {
-                        buf_delete(cur_pos(), 1)
+                        del_chars(cy, cx, 1)
                         chbuf[0] = k2
-                        void buf_insert(cur_pos(), &chbuf, 1)
+                        void ed_insert(cy, cx, &chbuf, 1)
                         cx++
                         c++
                     }
@@ -2878,7 +3524,7 @@ main {
                 if count == 0
                     count = 1
                 line_range(cy, count)
-                yank_range(lr_a, lr_b, true)
+                yank_range(true)
             }
             iso:'p' -> {
                 if count == 0
@@ -2996,7 +3642,8 @@ main {
         ubyte x
         ubyte y
         bool opened
-        sys.memset(cstate, 70, 0)
+        nbanks = cx16.numbanks()
+        db0 = DOC_BANK0
         init_screen()
         iso_mode()
         ; clear screen to black and hide the kernal cursor

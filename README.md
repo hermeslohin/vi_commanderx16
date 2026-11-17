@@ -70,9 +70,13 @@ Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to li
 
 ## Limits
 
-* The text buffer lives in main RAM: **about 7500 bytes / 500 lines** (the editor itself uses most of the ~38 KB).
-  Larger files are truncated on load and `:w` is refused until you force it with `:w!`.
-* Undo is single level (a snapshot kept in banked RAM, banks 1-8).
+* The file is kept in **banked RAM** as a chain of 2 KB pages; only one page is in main RAM at a time. On a 2 MB X16
+  that is roughly **1 MB / 20,000+ lines** (hard limit 60,000 lines). Larger files are truncated on load and `:w` is
+  refused until you force it with `:w!`. Run the emulator with `-ram 2048` (the Makefile does).
+* Lines longer than 700 characters are split when a file is loaded (and cannot be typed longer); only the first
+  255 characters of a line are syntax-coloured.
+* Undo is single level, page based (unchanged pages are shared with the snapshot, so it is cheap).
+* `dd` on the last line now really removes it (it used to leave an empty line behind).
 * BASIC keywords are only highlighted as whole words (`FOR I=1 TO 10`, not `FORI=1TO10`).
 
 ## Self test

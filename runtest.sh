@@ -59,8 +59,8 @@ rm -f build_test/vit.prg
 (cd build_test && java -jar "$J" -target cx16 vit.p8 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -E "ERROR|error")
 [ -f build_test/vit.prg ] || { echo "build failed"; exit 1; }
 rm -f tests/scr.out
-(/usr/local/x16emu/x16emu -rom /usr/local/x16emu/rom.bin -fsroot tests -prg build_test/vit.prg -run -warp >emu.log 2>&1 &)
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do sleep 1; [ -s tests/scr.out ] && sleep 1 && break; done
+(/usr/local/x16emu/x16emu -ram 2048 -rom /usr/local/x16emu/rom.bin -fsroot tests -prg build_test/vit.prg -run -warp >emu.log 2>&1 &)
+for i in $(seq 1 ${WAIT:-20}); do sleep 1; [ -s tests/scr.out ] && sleep 1 && break; done
 pkill x16emu
 python3 - "${2:-20}" <<'PY'
 import sys
