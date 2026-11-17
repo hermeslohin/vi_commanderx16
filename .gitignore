@@ -5,3 +5,5 @@ selftest.c
 emu.log
 tests/scr.out
 .DS_Store
+p8build/
+build_test/

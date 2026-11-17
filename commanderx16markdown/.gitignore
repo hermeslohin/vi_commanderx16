@@ -1,0 +1,12 @@
+md.map
+*.o
+selftest.prg
+selftest.c
+emu.log
+tests/scr.out
+tests/SCR.OUT
+tests/chr.out
+tests/CHR.OUT
+.DS_Store
+p8build/
+build_test/

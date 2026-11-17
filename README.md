@@ -1,6 +1,6 @@
 # VI for the Commander X16
 
-A small vi clone written in C (cc65) with syntax highlighting for **C**, **BASIC** and **6502 assembly**.
+A small vi clone written in C (cc65) with syntax highlighting for **C**, **BASIC**, **6502 assembly** and **Prog8**.
 It draws directly into VERA text memory in ISO mode, so files are plain ASCII.
 
 ## Build / run
@@ -47,13 +47,14 @@ Type `:help` inside the editor for a command summary.
 
 ## Syntax highlighting
 
-Chosen from the file extension, or set manually with `:set syntax=c|basic|asm|none`.
+Chosen from the file extension, or set manually with `:set syntax=c|basic|asm|prog8|none`.
 
 | language | extensions            | highlights                                                        |
 |----------|-----------------------|-------------------------------------------------------------------|
 | C        | .c .h                 | keywords, types, `#preprocessor`, strings, numbers, `//` and `/* */` (multi-line) |
 | BASIC    | .bas .bi              | keywords (incl. X16 BASIC 2: VPOKE, LOCATE, ...), functions, line numbers, REM, strings, numbers |
 | assembly | .asm .s .inc .a65 .a  | 65C02 mnemonics, `.directives`, labels, `$hex`/`%bin`, `;` comments, registers |
+| Prog8    | .p8 .prog8            | keywords, types and builtins, `%directives`, strings, `$hex`/`%bin`, `;` comments, `%asm {{ }}` blocks as assembly |
 
 ## Commands
 
@@ -62,6 +63,7 @@ Normal mode: `h j k l` / arrows, `0 ^ $`, `w b`, `gg G` (`12G`), `%`, `Ctrl-F`/`
 `u` (undo / redo toggle), `/text ? n N`, counts (`3dd`, `5x`), `ZZ`.
 
 Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to line),
+`:[range]s/old/new/[g]` (`:%s/a/b/g`, `:1,$ s/a/b/g`, `\/` for a literal delimiter),
 `:set nu|nonu`, `:set ts=N`, `:set ai|noai`, `:set syntax=...`, `:help`.
 
 ## Limits
@@ -75,3 +77,10 @@ Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to li
 
 `./runtest.sh '<keys>' [rows]` builds a variant that feeds scripted keystrokes, dumps the VERA
 screen (characters and colour indexes) to `tests/scr.out` and prints it. Sample sources are in `tests/`.
+
+## Prog8 port
+
+`vi.p8` is a Prog8 port of the editor (same keys and commands; `u` undo/redo, `:s` substitute and
+Prog8 highlighting are all in it). Build with `make p8` (needs `~/prog8c.jar`, Prog8 12.x) -> `p8build/vi.prg`,
+or `make runp8`. The Prog8 runtime is larger than cc65's, so its buffer is about **7500 bytes**.
+`./runtest_p8.sh '<keys>' [rows]` is the scripted-key screen test (`TESTFILE=test.p8` picks the file to open).
