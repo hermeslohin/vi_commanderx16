@@ -5,3 +5,5 @@ tests/SCR.OUT
 p8build/
 build_test/
 VI.ARG
+tests/keys.in
+tests/KEYS.IN

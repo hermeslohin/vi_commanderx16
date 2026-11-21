@@ -70,9 +70,19 @@ Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to li
 
 ## Limits
 
-* The file is kept in **banked RAM** as a chain of 2 KB pages; only one page is in main RAM at a time. On a 2 MB X16
-  that is roughly **1 MB / 20,000+ lines** (hard limit 60,000 lines). Larger files are truncated on load and `:w` is
-  refused until you force it with `:w!`. Run the emulator with `-ram 2048` (the Makefile does).
+* **Large files.** A file is not read into memory by `:e`: it is scanned once and cut into 1 KB pages, and each page
+  is read from the file when you get to it (scrolling, `G`, searching) and cached in banked RAM. Unchanged pages
+  are dropped from the cache whenever room is needed, so a file can be much larger than memory: up to
+  **65,000 lines** or about **3.5 MB** (whichever comes first), even on a 512 KB X16. Files with more lines are truncated on load and `:w` is
+  refused until you force it with `:w!`.
+* **Changed pages stay in memory** until you `:w`. If they fill it you get
+  `Memory full of changes: save (:w) to free it`; writing the file makes all of it free again. Since pages are read
+  back from the file while you work, do not change the file behind vi's back.
+* `:w` over the file that is open writes `vi.tmp` first and then copies it over the file (so the old text can be read
+  until the end); if that copy fails, your text is still in `vi.tmp`. Paging needs the X16's SD card / host file
+  system (CMDR-DOS, which can seek in a file). Run the emulator with `-ram 2048` (the Makefile does) for the
+  biggest cache.
+* Line endings: CR, LF and CRLF are read (and written as LF).
 * Lines longer than 700 characters are split when a file is loaded (and cannot be typed longer); only the first
   255 characters of a line are syntax-coloured.
 * Undo is single level, page based (unchanged pages are shared with the snapshot, so it is cheap).
@@ -85,3 +95,5 @@ Ex commands: `:w [file]`, `:q`, `:q!`, `:wq`, `:x`, `:e[!] file`, `:N` (go to li
 VERA screen (characters and colour indexes) to `tests/scr.out` and prints it. `TESTFILE=test.p8 ./runtest.sh ...`
 picks the file to open from `tests/` (default `test.c`; samples for every highlighted language are there).
 It uses `~/prog8c.jar` unless `PROG8C` is set.
+The keys (at most 254) are passed in `tests/keys.in`. `RAM=256 ./runtest.sh ...` runs the emulator with less banked
+RAM (default 2048), which makes the page cache small, so large files are really read back from disk as you move.
